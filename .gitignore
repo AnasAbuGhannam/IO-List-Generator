@@ -1,0 +1,15 @@
+# Generated output files
+IO List/
+
+# Excel temp/lock files
+~$*.xlsx
+~$*.xlsm
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code / IDE
+.vscode/
+.idea/
