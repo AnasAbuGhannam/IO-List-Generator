@@ -1,9 +1,10 @@
 """
 IO List Generator — Allen-Bradley / Rockwell Automation
-Reads a structured Excel workbook and generates a fully formatted IO List.
-Supports normal generation and manufacturing revision mode.
+Generates IO lists, EPLAN exports, L5X hardware configs, tag objects, and mirroring code.
 """
 import os
+import re
+import random
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -16,17 +17,17 @@ from openpyxl.utils import get_column_letter
 # ──────────────────────────────────────────────────────────────
 # STYLING CONSTANTS
 # ──────────────────────────────────────────────────────────────
-C_NAVY    = "FFC0C0C0"   # light gray (used everywhere navy was)
-C_ORANGE  = "FFFFC000"
-C_LGRAY   = "FFD9D9D9"
-C_DGRAY   = "FF595959"
-C_WHITE   = "FFFFFFFF"
-C_BLACK   = "FF000000"
-C_LBLUE   = "FFD6E4F0"
-C_LGREEN  = "FFE2EFDA"
-C_LYELLOW = "FFFFF2CC"
-C_LPINK   = "FFFCE4D6"
-C_RED_HDR = "FFC00000"
+C_NAVY       = "FFC0C0C0"
+C_ORANGE     = "FFFFC000"
+C_LGRAY      = "FFD9D9D9"
+C_DGRAY      = "FF595959"
+C_WHITE      = "FFFFFFFF"
+C_BLACK      = "FF000000"
+C_LBLUE      = "FFD6E4F0"
+C_LGREEN     = "FFE2EFDA"
+C_LYELLOW    = "FFFFF2CC"
+C_LPINK      = "FFFCE4D6"
+C_RED_HDR    = "FFC00000"
 C_UNASSIGNED = "FFFFD7D7"
 
 WIRE_COLORS = ["Black","Red","White","Green","Brown","Blue","Orange","Yellow","Gray","Purple",
@@ -46,6 +47,9 @@ COL_WIDTHS = {
     17:9.0,  18:8.14, 19:7.57, 20:15.14,21:9.0,  22:5.86, 23:6.43, 24:4.57,
     25:4.86, 26:8.0,  27:3.57, 28:2.14, 29:2.29, 30:3.57, 31:6.43, 32:6.0
 }
+
+TYPE_ORDER = ["DI", "DO", "AI", "AO"]
+POWER_MAP  = {"DI": "24VDC", "DO": "NO", "AI": "", "AO": ""}
 
 # ──────────────────────────────────────────────────────────────
 # EXCEL HELPERS
@@ -118,11 +122,12 @@ def read_workbook(path):
                 qty = 1
             hw_config.append({"rack": row[0], "model": row[1], "qty": qty})
 
-    # SIGNAL_MATRIX — row format: Category | SigType | SigRowName | EqType1 | EqType2 ...
+    # SIGNAL_MATRIX
     ws_mat = wb["SIGNAL_MATRIX"]
-    mat_header = [str(c).strip() if c else "" for c in next(ws_mat.iter_rows(min_row=1, max_row=1, values_only=True))]
-    eq_types = mat_header[3:]
-    matrix = {}
+    mat_header = [str(c).strip() if c else "" for c in
+                  next(ws_mat.iter_rows(min_row=1, max_row=1, values_only=True))]
+    eq_types  = mat_header[3:]
+    matrix    = {}
     sig_order = []
     for row in ws_mat.iter_rows(min_row=2, values_only=True):
         if not row[2]:
@@ -146,27 +151,120 @@ def read_workbook(path):
                 "system": row[3] if len(row) > 3 else ""
             })
 
-    return proj, module_db, hw_config, eq_types, matrix, sig_order, equipment
+    # PLC_ATTRIBUTES (optional sheet added by user)
+    plc_attributes = {}
+    if "PLC_ATTRIBUTES" in wb.sheetnames:
+        ws_plc = wb["PLC_ATTRIBUTES"]
+        sig_col = attr_col = None
+        for row in ws_plc.iter_rows(min_row=1, max_row=10, values_only=True):
+            for i, v in enumerate(row):
+                if v is not None and str(v).strip() == "Signal Description":
+                    sig_col = i
+                if v is not None and str(v).strip() == "PLC Attribute":
+                    attr_col = i
+            if sig_col is not None and attr_col is not None:
+                break
+        if sig_col is not None and attr_col is not None:
+            for row in ws_plc.iter_rows(min_row=2, values_only=True):
+                s = row[sig_col] if sig_col < len(row) else None
+                a = row[attr_col] if attr_col < len(row) else None
+                if s and a:
+                    plc_attributes[str(s).strip()] = str(a).strip()
+
+    return proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, plc_attributes
+
+
+def _quick_read_racks(path):
+    """Lightweight read of rack names only from HARDWARE_CONFIG sheet."""
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        if "HARDWARE_CONFIG" not in wb.sheetnames:
+            return []
+        ws = wb["HARDWARE_CONFIG"]
+        racks, seen = [], set()
+        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+            if row[0]:
+                r = str(row[0]).strip()
+                if r and r not in seen:
+                    racks.append(r)
+                    seen.add(r)
+        wb.close()
+        return racks
+    except:
+        return []
+
+
+# ──────────────────────────────────────────────────────────────
+# MODULE ASSIGNMENT HELPER  (used by IO list, EPLAN, L5X)
+# ──────────────────────────────────────────────────────────────
+def get_rack_module_assignments(hw_config, module_db):
+    """
+    Returns (assignments_by_rack, rack_order, slot_lookup) where:
+      assignments_by_rack = {rack_name: [{model, type, name, slot, qty}, ...]}
+      slot_lookup = {(rack_name, slot_num): {name, type, mod_idx_in_type}}
+    Modules sorted DI→DO→AI→AO within each rack; global type counters across all racks.
+    """
+    racks = {}
+    rack_order = []
+    for row in hw_config:
+        rack_name = row["rack"]
+        if rack_name not in racks:
+            racks[rack_name] = []
+            rack_order.append(rack_name)
+        info = module_db.get(row["model"])
+        if not info:
+            continue
+        for _ in range(row["qty"]):
+            racks[rack_name].append({"model": row["model"], "type": info["type"], "qty": info["qty"]})
+
+    global_type_counter = {t: 0 for t in TYPE_ORDER}
+    assignments_by_rack = {}
+    slot_lookup = {}
+    global_slot = 1
+
+    for rack_name in rack_order:
+        modules = racks[rack_name]
+        rack_slot_start = global_slot
+        rack_by_type = {t: [m for m in modules if m["type"] == t] for t in TYPE_ORDER}
+        rack_assignments = []
+
+        for sig_type in TYPE_ORDER:
+            for mod_idx, mod in enumerate(rack_by_type[sig_type]):
+                global_type_counter[sig_type] += 1
+                mod_name = f"{sig_type}_{str(global_type_counter[sig_type]).zfill(2)}"
+                slot_num = rack_slot_start + sum(
+                    len(rack_by_type[t]) for t in TYPE_ORDER[:TYPE_ORDER.index(sig_type)]
+                ) + mod_idx
+                entry = {
+                    "model":   mod["model"],
+                    "type":    sig_type,
+                    "name":    mod_name,
+                    "slot":    slot_num,
+                    "qty":     mod["qty"],
+                    "mod_idx": global_type_counter[sig_type],
+                }
+                rack_assignments.append(entry)
+                slot_lookup[(rack_name, slot_num)] = entry
+
+        assignments_by_rack[rack_name] = rack_assignments
+        global_slot += len(modules)
+
+    return assignments_by_rack, rack_order, slot_lookup
 
 
 # ──────────────────────────────────────────────────────────────
 # MANUFACTURING IO LIST PARSER
 # ──────────────────────────────────────────────────────────────
 def parse_manufacturing_io_list(path):
-    """Parse a previously generated IO List Excel file into a flat channel list."""
     wb = openpyxl.load_workbook(path, data_only=True)
     if "IO List" not in wb.sheetnames:
         raise ValueError("Attached file does not contain an 'IO List' sheet.")
     ws = wb["IO List"]
 
     TYPE_SUFFIX_REV = {"DIM": "DI", "DOM": "DO", "AIM": "AI", "AOM": "AO"}
-
     channels = []
-    current_rack_name = ""
-    current_model = ""
-    current_mod_desc = ""
-    current_rack_num = 0
-    current_slot_num = 0
+    current_rack_name = current_model = current_mod_desc = ""
+    current_rack_num = current_slot_num = 0
 
     for row in ws.iter_rows(min_row=3, values_only=True):
         if not any(v for v in row):
@@ -176,21 +274,17 @@ def parse_manufacturing_io_list(path):
             v = row[i] if i < len(row) else None
             return str(v).strip() if v is not None else ""
 
-        type_val = cell(8)  # column 9
-
+        type_val = cell(8)
         if type_val == "Processor":
             continue
-
         if type_val in TYPE_SUFFIX_REV:
             current_rack_name = cell(0)
-            col4_val = cell(3)
-            if " — " in col4_val:
-                parts = col4_val.split(" — ", 1)
-                current_model = parts[0].strip()
-                current_mod_desc = parts[1].strip()
+            col4 = cell(3)
+            if " — " in col4:
+                parts = col4.split(" — ", 1)
+                current_model, current_mod_desc = parts[0].strip(), parts[1].strip()
             else:
-                current_model = col4_val
-                current_mod_desc = ""
+                current_model, current_mod_desc = col4, ""
             try:
                 current_rack_num = int(cell(5))
             except:
@@ -200,21 +294,14 @@ def parse_manufacturing_io_list(path):
             except:
                 current_slot_num = 0
             continue
-
         if type_val in ("DI", "DO", "AI", "AO"):
-            tag = cell(1)
+            tag      = cell(1)
             sig_desc = cell(4)
-            is_spare = (not tag or sig_desc == "SPARE")
-            try:
-                ch = int(cell(7))
-            except:
-                ch = 0
-
             channels.append({
                 "rack_name":  current_rack_name,
                 "rack_num":   current_rack_num,
                 "slot_num":   current_slot_num,
-                "ch":         ch,
+                "ch":         int(cell(7)) if cell(7).isdigit() else 0,
                 "sig_type":   type_val,
                 "model":      current_model,
                 "mod_desc":   current_mod_desc,
@@ -228,7 +315,7 @@ def parse_manufacturing_io_list(path):
                 "t2":         cell(12),
                 "power":      cell(14),
                 "io_addr":    cell(0),
-                "is_spare":   is_spare,
+                "is_spare":   (not tag or sig_desc == "SPARE"),
             })
 
     if not channels:
@@ -241,7 +328,7 @@ def parse_manufacturing_io_list(path):
 # ──────────────────────────────────────────────────────────────
 def get_sig_type(sig_row_name):
     n = sig_row_name.strip().upper()
-    for t in ("DI", "DO", "AI", "AO"):
+    for t in TYPE_ORDER:
         if n.startswith(t):
             return t
     return None
@@ -249,14 +336,12 @@ def get_sig_type(sig_row_name):
 
 def build_io_list(proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, log_fn=None):
     def log(msg):
-        if log_fn:
-            log_fn(msg)
+        if log_fn: log_fn(msg)
 
-    prefix   = proj.get("Controller Tag Prefix", "PLC-1")
-
-    # Build signal demand per type
-    demand = {"DI": [], "DO": [], "AI": [], "AO": []}
+    prefix = proj.get("Controller Tag Prefix", "PLC-1")
+    demand = {t: [] for t in TYPE_ORDER}
     unknown_types = set()
+
     for eq in equipment:
         eq_type = eq["type"]
         if eq_type not in eq_types:
@@ -270,19 +355,14 @@ def build_io_list(proj, module_db, hw_config, eq_types, matrix, sig_order, equip
             if not st:
                 continue
             demand[st].append({
-                "tag":      eq["tag"],
-                "eq_desc":  eq["desc"],
-                "sig_desc": sig_desc,
-                "system":   eq["system"],
-                "eq_type":  eq_type,
-                "sig_row":  sig_name,
+                "tag": eq["tag"], "eq_desc": eq["desc"], "sig_desc": sig_desc,
+                "system": eq["system"], "eq_type": eq_type, "sig_row": sig_name,
                 "_assigned": False,
             })
 
     if unknown_types:
-        log(f"⚠  Unknown equipment types (not in signal matrix): {', '.join(unknown_types)}")
+        log(f"⚠  Unknown equipment types: {', '.join(unknown_types)}")
 
-    # Build rack structure
     racks = {}
     rack_order = []
     for row in hw_config:
@@ -295,148 +375,101 @@ def build_io_list(proj, module_db, hw_config, eq_types, matrix, sig_order, equip
             log(f"⚠  Module '{row['model']}' not found in MODULE_DB — skipped.")
             continue
         for _ in range(row["qty"]):
-            racks[rack_name].append({
-                "model": row["model"],
-                "desc":  info["desc"],
-                "type":  info["type"],
-                "qty":   info["qty"],
-            })
+            racks[rack_name].append({"model": row["model"], "desc": info["desc"],
+                                     "type": info["type"], "qty": info["qty"]})
 
     io_rows = []
     global_slot = 1
-    TYPE_ORDER  = ["DI", "DO", "AI", "AO"]
-    POWER_MAP   = {"DI": "24VDC", "DO": "NO", "AI": "", "AO": ""}
 
     for rack_name in rack_order:
-        rack_num  = rack_order.index(rack_name) + 1
-        modules   = racks[rack_name]
+        rack_num = rack_order.index(rack_name) + 1
+        modules  = racks[rack_name]
         rack_slot_start = global_slot
-        rack_modules_by_type = {t: [m for m in modules if m["type"] == t] for t in TYPE_ORDER}
+        rack_by_type = {t: [m for m in modules if m["type"] == t] for t in TYPE_ORDER}
 
         for sig_type in TYPE_ORDER:
-            type_modules = rack_modules_by_type[sig_type]
+            type_modules = rack_by_type[sig_type]
             if not type_modules:
                 continue
-
             pending = [d for d in demand[sig_type] if not d["_assigned"]]
             pending_idx = 0
 
             for mod_idx, mod in enumerate(type_modules):
                 slot_num = rack_slot_start + sum(
-                    len(rack_modules_by_type[t])
-                    for t in TYPE_ORDER[:TYPE_ORDER.index(sig_type)]
+                    len(rack_by_type[t]) for t in TYPE_ORDER[:TYPE_ORDER.index(sig_type)]
                 ) + mod_idx
 
                 io_rows.append({
                     "_row_type": "mod_header",
-                    "rack_num":  rack_num,
-                    "rack_name": rack_name,
-                    "slot_num":  slot_num,
-                    "model":     mod["model"],
-                    "desc":      mod["desc"],
-                    "sig_type":  sig_type,
-                    "controller": prefix,
+                    "rack_num": rack_num, "rack_name": rack_name,
+                    "slot_num": slot_num, "model": mod["model"],
+                    "desc": mod["desc"], "sig_type": sig_type, "controller": prefix,
                 })
 
                 for ch in range(mod["qty"]):
                     addr = f"{sig_type}_{str(rack_num).zfill(2)}.{str(slot_num).zfill(2)}"
                     term = f"{sig_type}-{str(slot_num).zfill(3)}/{ch // 8 + 1}"
-
                     if pending_idx < len(pending):
                         d = pending[pending_idx]
                         io_rows.append({
-                            "_row_type":  "signal",
-                            "controller": addr,
-                            "tag":        d["tag"],
-                            "eq_desc":    d["eq_desc"],
-                            "sig_desc":   d["sig_desc"],
-                            "system":     d["system"],
-                            "rack":       rack_num,
-                            "rack_name":  rack_name,
-                            "slot":       slot_num,
-                            "ch":         ch,
-                            "sig_type":   sig_type,
+                            "_row_type": "signal",
+                            "controller": addr, "tag": d["tag"],
+                            "eq_desc": d["eq_desc"], "sig_desc": d["sig_desc"],
+                            "system": d["system"], "rack": rack_num, "rack_name": rack_name,
+                            "slot": slot_num, "ch": ch, "sig_type": sig_type,
                             "wire_color": WIRE_COLORS[ch % len(WIRE_COLORS)],
-                            "term_block": term,
-                            "t1": f"{ch}A",
-                            "t2": f"{ch}B",
+                            "term_block": term, "t1": f"{ch}A", "t2": f"{ch}B",
                             "power": POWER_MAP.get(sig_type, ""),
                         })
                         d["_assigned"] = True
                         pending_idx += 1
                     else:
                         io_rows.append({
-                            "_row_type":  "spare",
-                            "controller": addr,
-                            "sig_type":   sig_type,
-                            "rack":       rack_num,
-                            "rack_name":  rack_name,
-                            "slot":       slot_num,
-                            "ch":         ch,
+                            "_row_type": "spare",
+                            "controller": addr, "sig_type": sig_type,
+                            "rack": rack_num, "rack_name": rack_name, "slot": slot_num, "ch": ch,
                             "wire_color": WIRE_COLORS[ch % len(WIRE_COLORS)],
-                            "term_block": term,
-                            "t1": f"{ch}A",
-                            "t2": f"{ch}B",
+                            "term_block": term, "t1": f"{ch}A", "t2": f"{ch}B",
                             "power": POWER_MAP.get(sig_type, ""),
                         })
 
         global_slot += len(modules)
 
-    # Collect any signals that couldn't fit in any rack
     warnings = []
-    all_unassigned = []
-    for sig_type in TYPE_ORDER:
-        for d in demand[sig_type]:
-            if not d["_assigned"]:
-                all_unassigned.append(d)
-                w = (f"Unassigned — {d['tag']} / {d['sig_desc']} ({sig_type}): "
-                     f"no available channels across all racks.")
-                warnings.append(w)
-                log(f"⚠  {w}")
-
-    # Build final_rows with rack headers injected before first module of each rack
     final_rows = []
     seen_racks = set()
+
     for r in io_rows:
         if r["_row_type"] in ("mod_header", "signal", "spare"):
-            actual_rack = r.get("rack_name", f"RACK {str(r.get('rack', 0)).zfill(2)}")
-            if actual_rack not in seen_racks:
-                final_rows.append({
-                    "_row_type":  "rack_header",
-                    "rack_name":  actual_rack,
-                    "controller": r.get("controller", prefix),
-                })
-                seen_racks.add(actual_rack)
+            rack_key = r.get("rack_name", f"RACK {str(r.get('rack', 0)).zfill(2)}")
+            if rack_key not in seen_racks:
+                final_rows.append({"_row_type": "rack_header", "rack_name": rack_key,
+                                   "controller": r.get("controller", prefix)})
+                seen_racks.add(rack_key)
         final_rows.append(r)
 
-    for d in all_unassigned:
-        final_rows.append({"_row_type": "unassigned", **d})
+    for t in TYPE_ORDER:
+        for d in demand[t]:
+            if not d["_assigned"]:
+                w = f"Unassigned — {d['tag']} / {d['sig_desc']} ({t}): no channels in any rack."
+                warnings.append(w)
+                log(f"⚠  {w}")
+                final_rows.append({"_row_type": "unassigned", **d})
 
     counts = {t: sum(1 for r in final_rows if r["_row_type"] == "signal" and r.get("sig_type") == t)
               for t in TYPE_ORDER}
-    total = sum(counts.values())
-    log(f"✓ Generation complete — DI:{counts['DI']} DO:{counts['DO']} AI:{counts['AI']} AO:{counts['AO']} — Total:{total}")
-
+    log(f"✓ Generation complete — DI:{counts['DI']} DO:{counts['DO']} AI:{counts['AI']} AO:{counts['AO']} — Total:{sum(counts.values())}")
     return final_rows, counts, warnings
 
 
 def build_io_list_revision(proj, module_db, mfg_channels, eq_types, matrix, sig_order, equipment, log_fn=None):
-    """
-    Revision mode: update an existing manufacturing IO list with a new equipment list.
-    Physical channel positions are preserved. Removed equipment becomes SPARE.
-    New equipment is assigned to the first available SPARE channels of matching type.
-    Raises ValueError if there are insufficient spare channels.
-    """
     def log(msg):
-        if log_fn:
-            log_fn(msg)
+        if log_fn: log_fn(msg)
 
     prefix = proj.get("Controller Tag Prefix", "PLC-1")
-    TYPE_ORDER = ["DI", "DO", "AI", "AO"]
-
-    # Build new demand from updated equipment list
     new_demand = []
     unknown_types = set()
+
     for eq in equipment:
         eq_type = eq["type"]
         if eq_type not in eq_types:
@@ -450,183 +483,117 @@ def build_io_list_revision(proj, module_db, mfg_channels, eq_types, matrix, sig_
             if not st:
                 continue
             new_demand.append({
-                "tag":      eq["tag"],
-                "eq_desc":  eq["desc"],
-                "sig_desc": sig_desc,
-                "system":   eq["system"],
-                "sig_type": st,
-                "_assigned": False,
+                "tag": eq["tag"], "eq_desc": eq["desc"], "sig_desc": sig_desc,
+                "system": eq["system"], "sig_type": st, "_assigned": False,
             })
 
     if unknown_types:
         log(f"⚠  Unknown equipment types: {', '.join(unknown_types)}")
 
-    # Index new demand by (tag, sig_desc) for O(1) lookup
     demand_lookup = {}
     for d in new_demand:
-        key = (d["tag"], d["sig_desc"])
-        if key not in demand_lookup:
-            demand_lookup[key] = d
+        k = (d["tag"], d["sig_desc"])
+        if k not in demand_lookup:
+            demand_lookup[k] = d
 
-    # First pass: decide keep vs spare for each channel in the mfg IO list
     revised = []
     for ch in mfg_channels:
-        key = (ch["tag"], ch["sig_desc"])
-        if (not ch["is_spare"]
-                and key in demand_lookup
-                and not demand_lookup[key]["_assigned"]):
+        k = (ch["tag"], ch["sig_desc"])
+        if not ch["is_spare"] and k in demand_lookup and not demand_lookup[k]["_assigned"]:
             revised.append({**ch, "status": "signal"})
-            demand_lookup[key]["_assigned"] = True
+            demand_lookup[k]["_assigned"] = True
         else:
-            revised.append({
-                **ch,
-                "status":   "spare",
-                "tag":      "",
-                "sig_desc": "SPARE",
-                "eq_desc":  "",
-                "system":   "",
-                "is_spare": True,
-            })
+            revised.append({**ch, "status": "spare", "tag": "", "sig_desc": "SPARE",
+                            "eq_desc": "", "system": "", "is_spare": True})
 
-    # Gather unassigned new signals
     unassigned_new = [d for d in new_demand if not d["_assigned"]]
-    log(f"Signals kept from manufacturing list: {sum(1 for r in revised if r['status'] == 'signal')}")
-    log(f"New signals to assign: {len(unassigned_new)}")
+    log(f"Kept from manufacturing: {sum(1 for r in revised if r['status'] == 'signal')}, new to assign: {len(unassigned_new)}")
 
-    # Count spare channels by type
-    spare_indices_by_type = {t: [] for t in TYPE_ORDER}
+    spare_by_type = {t: [] for t in TYPE_ORDER}
     for i, ch in enumerate(revised):
-        if ch["status"] == "spare" and ch["sig_type"] in spare_indices_by_type:
-            spare_indices_by_type[ch["sig_type"]].append(i)
+        if ch["status"] == "spare" and ch["sig_type"] in spare_by_type:
+            spare_by_type[ch["sig_type"]].append(i)
 
-    # Check capacity before making any assignments
     needed_by_type = {}
     for d in unassigned_new:
         needed_by_type[d["sig_type"]] = needed_by_type.get(d["sig_type"], 0) + 1
 
     shortage = {}
     for sig_type, needed in needed_by_type.items():
-        available = len(spare_indices_by_type.get(sig_type, []))
-        if needed > available:
-            shortage[sig_type] = {"needed": needed, "available": available, "short": needed - available}
+        avail = len(spare_by_type.get(sig_type, []))
+        if needed > avail:
+            shortage[sig_type] = {"needed": needed, "available": avail, "short": needed - avail}
 
     if shortage:
         DEFAULT_CH = {"DI": 8, "DO": 8, "AI": 8, "AO": 4}
         lines = []
         for sig_type, info in shortage.items():
-            ch_per_mod = DEFAULT_CH.get(sig_type, 8)
-            mods_needed = (info["short"] + ch_per_mod - 1) // ch_per_mod
-            lines.append(
-                f"  • {sig_type}: need {info['short']} more channel(s) "
-                f"→ add at least {mods_needed} more {sig_type} module(s) to HARDWARE_CONFIG"
-            )
+            mods = (info["short"] + DEFAULT_CH.get(sig_type, 8) - 1) // DEFAULT_CH.get(sig_type, 8)
+            lines.append(f"  • {sig_type}: need {info['short']} more channel(s) → add {mods} more {sig_type} module(s) to HARDWARE_CONFIG")
         raise ValueError(
-            "Cannot complete revision — insufficient spare channels:\n"
-            + "\n".join(lines)
-            + "\n\nTo resolve:\n"
-              "  1. Open your input workbook\n"
-              "  2. In HARDWARE_CONFIG, add the required modules\n"
-              "  3. Run revision mode again with the updated workbook"
+            "Cannot complete revision — insufficient spare channels:\n" + "\n".join(lines) +
+            "\n\nTo resolve:\n  1. Open your input workbook\n"
+            "  2. In HARDWARE_CONFIG, add the required modules\n"
+            "  3. Run revision mode again with the updated workbook"
         )
 
-    # Assign new signals to spare channels in order
     for d in unassigned_new:
-        spare_list = spare_indices_by_type[d["sig_type"]]
-        idx = spare_list.pop(0)
+        idx = spare_by_type[d["sig_type"]].pop(0)
         ch = revised[idx]
-        revised[idx] = {
-            **ch,
-            "status":   "signal",
-            "tag":      d["tag"],
-            "eq_desc":  d["eq_desc"],
-            "sig_desc": d["sig_desc"],
-            "system":   d["system"],
-            "is_spare": False,
-        }
+        revised[idx] = {**ch, "status": "signal", "tag": d["tag"], "eq_desc": d["eq_desc"],
+                        "sig_desc": d["sig_desc"], "system": d["system"], "is_spare": False}
         d["_assigned"] = True
         log(f"  Assigned {d['tag']} / {d['sig_desc']} → {ch['sig_type']} slot {ch['slot_num']} ch {ch['ch']}")
 
-    # Build final_rows preserving physical order from the manufacturing IO list
     final_rows = []
     seen_racks = set()
     prev_slot_key = None
 
     for ch in revised:
-        rack_key  = ch["rack_name"]
-        slot_key  = (ch["rack_num"], ch["slot_num"])
-
+        rack_key = ch["rack_name"]
+        slot_key = (ch["rack_num"], ch["slot_num"])
         if rack_key not in seen_racks:
-            final_rows.append({
-                "_row_type":  "rack_header",
-                "rack_name":  rack_key,
-                "controller": prefix,
-            })
+            final_rows.append({"_row_type": "rack_header", "rack_name": rack_key, "controller": prefix})
             seen_racks.add(rack_key)
-
         if slot_key != prev_slot_key:
             mod_info = module_db.get(ch["model"], {})
             final_rows.append({
-                "_row_type":  "mod_header",
-                "rack_num":   ch["rack_num"],
-                "rack_name":  ch["rack_name"],
-                "slot_num":   ch["slot_num"],
-                "model":      ch["model"],
-                "desc":       mod_info.get("desc", ch.get("mod_desc", "")),
-                "sig_type":   ch["sig_type"],
-                "controller": prefix,
+                "_row_type": "mod_header", "rack_num": ch["rack_num"], "rack_name": ch["rack_name"],
+                "slot_num": ch["slot_num"], "model": ch["model"],
+                "desc": mod_info.get("desc", ch.get("mod_desc", "")),
+                "sig_type": ch["sig_type"], "controller": prefix,
             })
             prev_slot_key = slot_key
 
         if ch["status"] == "signal":
             final_rows.append({
-                "_row_type":  "signal",
-                "controller": ch["io_addr"],
-                "tag":        ch["tag"],
-                "eq_desc":    ch["eq_desc"],
-                "sig_desc":   ch["sig_desc"],
-                "system":     ch["system"],
-                "rack":       ch["rack_num"],
-                "rack_name":  ch["rack_name"],
-                "slot":       ch["slot_num"],
-                "ch":         ch["ch"],
-                "sig_type":   ch["sig_type"],
-                "wire_color": ch["wire_color"],
-                "term_block": ch["term_block"],
-                "t1":         ch["t1"],
-                "t2":         ch["t2"],
-                "power":      ch["power"],
+                "_row_type": "signal", "controller": ch["io_addr"],
+                "tag": ch["tag"], "eq_desc": ch["eq_desc"], "sig_desc": ch["sig_desc"],
+                "system": ch["system"], "rack": ch["rack_num"], "rack_name": ch["rack_name"],
+                "slot": ch["slot_num"], "ch": ch["ch"], "sig_type": ch["sig_type"],
+                "wire_color": ch["wire_color"], "term_block": ch["term_block"],
+                "t1": ch["t1"], "t2": ch["t2"], "power": ch["power"],
             })
         else:
             final_rows.append({
-                "_row_type":  "spare",
-                "controller": ch["io_addr"],
-                "sig_type":   ch["sig_type"],
-                "rack":       ch["rack_num"],
-                "rack_name":  ch["rack_name"],
-                "slot":       ch["slot_num"],
-                "ch":         ch["ch"],
-                "wire_color": ch["wire_color"],
-                "term_block": ch["term_block"],
-                "t1":         ch["t1"],
-                "t2":         ch["t2"],
-                "power":      ch["power"],
+                "_row_type": "spare", "controller": ch["io_addr"], "sig_type": ch["sig_type"],
+                "rack": ch["rack_num"], "rack_name": ch["rack_name"], "slot": ch["slot_num"],
+                "ch": ch["ch"], "wire_color": ch["wire_color"], "term_block": ch["term_block"],
+                "t1": ch["t1"], "t2": ch["t2"], "power": ch["power"],
             })
 
     counts = {t: sum(1 for r in final_rows if r["_row_type"] == "signal" and r.get("sig_type") == t)
               for t in TYPE_ORDER}
-    total = sum(counts.values())
-    log(f"✓ Revision complete — DI:{counts['DI']} DO:{counts['DO']} AI:{counts['AI']} AO:{counts['AO']} — Total:{total}")
-
+    log(f"✓ Revision complete — DI:{counts['DI']} DO:{counts['DO']} AI:{counts['AI']} AO:{counts['AO']} — Total:{sum(counts.values())}")
     return final_rows, counts, []
 
 
 # ──────────────────────────────────────────────────────────────
-# EXCEL WRITER
+# IO LIST EXCEL WRITER
 # ──────────────────────────────────────────────────────────────
 def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn=None):
     def log(msg):
-        if log_fn:
-            log_fn(msg)
+        if log_fn: log_fn(msg)
 
     wb  = openpyxl.Workbook()
     ws  = wb.active
@@ -640,28 +607,18 @@ def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn
     for col_idx, width in COL_WIDTHS.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    # ── Header row 1 ──
     for col, header in enumerate(IO_COLUMNS, 1):
-        c = ws.cell(1, col)
-        _style(c, header, bg=C_NAVY, fg=C_BLACK, bold=True, sz=10)
+        _style(ws.cell(1, col), header, bg=C_NAVY, fg=C_BLACK, bold=True, sz=10)
     ws.row_dimensions[1].height = 38
 
-    # ── Sub-header row 2 ──
     for col in range(1, 33):
-        c = ws.cell(2, col)
-        _style(c, None, bg=C_NAVY, fg=C_BLACK, bold=True, sz=10)
-    ws.cell(2, 24).value = "Min"
-    ws.cell(2, 25).value = "Max"
-    ws.cell(2, 27).value = "LL"
-    ws.cell(2, 28).value = "L"
-    ws.cell(2, 29).value = "H"
-    ws.cell(2, 30).value = "HH"
+        _style(ws.cell(2, col), None, bg=C_NAVY, fg=C_BLACK, bold=True, sz=10)
+    for col, val in [(24,"Min"),(25,"Max"),(27,"LL"),(28,"L"),(29,"H"),(30,"HH")]:
+        ws.cell(2, col).value = val
     ws.row_dimensions[2].height = 15
-
     ws.merge_cells("X1:Y1")
     ws.merge_cells("AA1:AD1")
 
-    # ── Controller row ──
     current_row = 3
     _style(ws.cell(current_row, 1), prefix, bg=C_ORANGE, bold=True)
     _style(ws.cell(current_row, 4), ctrl,   bg=C_ORANGE, bold=True)
@@ -685,56 +642,49 @@ def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn
             pass
 
         elif rt == "mod_header":
-            rack_name = r["rack_name"]
-            sig_type  = r["sig_type"]
-            _style(ws.cell(current_row, 1), rack_name,
-                   bg=C_NAVY, fg=C_BLACK, bold=True)
+            sig_type = r["sig_type"]
+            _style(ws.cell(current_row, 1), r["rack_name"], bg=C_NAVY, fg=C_BLACK, bold=True)
             _style(ws.cell(current_row, 4), f"{r['model']} — {r['desc']}",
                    bg=C_NAVY, fg=C_BLACK, bold=True, h="left")
-            _style(ws.cell(current_row, 6), r["rack_num"],
-                   bg=C_NAVY, fg=C_BLACK, bold=True)
-            _style(ws.cell(current_row, 7), r["slot_num"],
-                   bg=C_NAVY, fg=C_BLACK, bold=True)
+            _style(ws.cell(current_row, 6), r["rack_num"], bg=C_NAVY, fg=C_BLACK, bold=True)
+            _style(ws.cell(current_row, 7), r["slot_num"], bg=C_NAVY, fg=C_BLACK, bold=True)
             _style(ws.cell(current_row, 9),
-                   {"DI": "DIM", "DO": "DOM", "AI": "AIM", "AO": "AOM"}.get(sig_type, sig_type),
+                   {"DI":"DIM","DO":"DOM","AI":"AIM","AO":"AOM"}.get(sig_type, sig_type),
                    bg=C_NAVY, fg=C_BLACK, bold=True)
             for col in [2,3,5,8,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]:
                 c = ws.cell(current_row, col)
-                c.fill   = _fill(C_NAVY)
+                c.fill = _fill(C_NAVY)
                 c.border = _border()
             ws.row_dimensions[current_row].height = 16
             current_row += 1
 
         elif rt == "signal":
             sig_type = r["sig_type"]
-            bg       = SIG_BG.get(sig_type, C_WHITE)
+            bg = SIG_BG.get(sig_type, C_WHITE)
             row_data = [
                 r["controller"], r["tag"], "", r["eq_desc"], r["sig_desc"],
                 r["rack"], r["slot"], r["ch"], sig_type, r["wire_color"],
                 r["term_block"], r["t1"], r["t2"], "",
-                r["power"], "S", "",
-                r["system"], "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+                r["power"], "S", "", r["system"],
+                "", "", "", "", "", "", "", "", "", "", "", "", "", ""
             ]
             for col, val in enumerate(row_data, 1):
                 c = ws.cell(current_row, col)
                 _style(c, val if val != "" else None,
-                       bg=bg if col == 1 else None,
-                       bold=(col == 1),
-                       h="center" if col not in (4, 5, 18) else "left",
-                       sz=10)
+                       bg=bg if col == 1 else None, bold=(col == 1),
+                       h="center" if col not in (4, 5, 18) else "left", sz=10)
             ws.row_dimensions[current_row].height = 16
             current_row += 1
 
         elif rt == "spare":
             sig_type = r["sig_type"]
-            bg       = SIG_BG.get(sig_type, C_WHITE)
+            bg = SIG_BG.get(sig_type, C_WHITE)
             row_data = [
-                r.get("controller", ""), "", "", "", "SPARE",
-                r.get("rack", ""), r.get("slot", ""), r.get("ch", ""), sig_type,
-                r.get("wire_color", ""), r.get("term_block", ""),
-                r.get("t1", ""), r.get("t2", ""), "",
-                r.get("power", ""), "", "",
-                "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+                r.get("controller",""), "", "", "", "SPARE",
+                r.get("rack",""), r.get("slot",""), r.get("ch",""), sig_type,
+                r.get("wire_color",""), r.get("term_block",""),
+                r.get("t1",""), r.get("t2",""), "", r.get("power",""),
+                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""
             ]
             for col, val in enumerate(row_data, 1):
                 c = ws.cell(current_row, col)
@@ -746,9 +696,9 @@ def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn
         elif rt == "unassigned":
             for col in range(1, 33):
                 c = ws.cell(current_row, col)
-                c.fill   = _fill(C_UNASSIGNED)
+                c.fill = _fill(C_UNASSIGNED)
                 c.border = _border()
-                c.font   = _font(C_RED_HDR, bold=True, sz=10)
+                c.font = _font(C_RED_HDR, bold=True, sz=10)
             ws.cell(current_row, 1).value = "UNASSIGNED"
             ws.cell(current_row, 2).value = r["tag"]
             ws.cell(current_row, 4).value = r["eq_desc"]
@@ -757,7 +707,7 @@ def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn
             ws.row_dimensions[current_row].height = 16
             current_row += 1
 
-    # ── SUMMARY sheet ──
+    # Summary sheet
     ws2 = wb.create_sheet("Generation Summary")
     ws2.column_dimensions["A"].width = 35
     ws2.column_dimensions["B"].width = 25
@@ -765,14 +715,14 @@ def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn
 
     def s2h(cell, val, bg=C_NAVY, fg=C_BLACK):
         cell.value = val
-        cell.font  = _font(fg, 11, True)
-        cell.fill  = _fill(bg)
+        cell.font = _font(fg, 11, True)
+        cell.fill = _fill(bg)
         cell.border = _border()
         cell.alignment = _align()
 
     def s2b(cell, val, bg=None, bold=False, fg=C_BLACK):
         cell.value = val
-        cell.font  = _font(fg, 10, bold)
+        cell.font = _font(fg, 10, bold)
         if bg: cell.fill = _fill(bg)
         cell.border = _border()
         cell.alignment = _align("left")
@@ -781,60 +731,386 @@ def write_output(proj, module_db, final_rows, counts, warnings, out_path, log_fn
     gen_info = [
         ("Project Name",    proj.get("Project Name",          "")),
         ("Project Number",  proj.get("Project Number",        "")),
-        ("Controller",      proj.get("Controller Tag Prefix", "") + "  " + proj.get("Controller Model", "")),
+        ("Controller",      proj.get("Controller Tag Prefix","") + "  " + proj.get("Controller Model","")),
         ("Engineer",        proj.get("Engineer Name",         "")),
         ("Generation Date", now.strftime("%Y-%m-%d")),
         ("Generation Time", now.strftime("%H:%M:%S")),
     ]
 
     r2 = 1
-    s2h(ws2.cell(r2, 1), "Generation Report", C_NAVY)
+    s2h(ws2.cell(r2,1), "Generation Report", C_NAVY)
     ws2.merge_cells(f"A{r2}:C{r2}")
     ws2.row_dimensions[r2].height = 25
     r2 += 1
 
     for label, val in gen_info:
-        s2h(ws2.cell(r2, 1), label, C_LGRAY, C_BLACK)
-        s2b(ws2.cell(r2, 2), val)
+        s2h(ws2.cell(r2,1), label, C_LGRAY, C_BLACK)
+        s2b(ws2.cell(r2,2), val)
         ws2.merge_cells(f"B{r2}:C{r2}")
         r2 += 1
 
     r2 += 1
-    s2h(ws2.cell(r2, 1), "IO Signal Counts", C_NAVY)
+    s2h(ws2.cell(r2,1), "IO Signal Counts", C_NAVY)
     ws2.merge_cells(f"A{r2}:C{r2}")
     ws2.row_dimensions[r2].height = 20
     r2 += 1
 
-    type_fill = {"DI": C_LBLUE, "DO": C_LGREEN, "AI": C_LYELLOW, "AO": C_LPINK}
+    type_fill = {"DI":C_LBLUE,"DO":C_LGREEN,"AI":C_LYELLOW,"AO":C_LPINK}
     for sig_type, count in counts.items():
-        s2h(ws2.cell(r2, 1), sig_type, type_fill.get(sig_type, C_WHITE), C_BLACK)
-        s2b(ws2.cell(r2, 2), count)
+        s2h(ws2.cell(r2,1), sig_type, type_fill.get(sig_type, C_WHITE), C_BLACK)
+        s2b(ws2.cell(r2,2), count)
         r2 += 1
-    s2h(ws2.cell(r2, 1), "TOTAL", C_NAVY)
-    s2b(ws2.cell(r2, 2), sum(counts.values()), bold=True)
+    s2h(ws2.cell(r2,1), "TOTAL", C_NAVY)
+    s2b(ws2.cell(r2,2), sum(counts.values()), bold=True)
     r2 += 2
 
     if warnings:
-        s2h(ws2.cell(r2, 1), f"Warnings ({len(warnings)})", C_RED_HDR, C_WHITE)
+        s2h(ws2.cell(r2,1), f"Warnings ({len(warnings)})", C_RED_HDR, C_WHITE)
         ws2.merge_cells(f"A{r2}:C{r2}")
         ws2.row_dimensions[r2].height = 20
         r2 += 1
         for w in warnings:
-            c = ws2.cell(r2, 1)
+            c = ws2.cell(r2,1)
             c.value = w
-            c.font  = _font(C_RED_HDR, 9)
-            c.fill  = _fill(C_UNASSIGNED)
+            c.font = _font(C_RED_HDR, 9)
+            c.fill = _fill(C_UNASSIGNED)
             c.border = _border()
             c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
             ws2.merge_cells(f"A{r2}:C{r2}")
             ws2.row_dimensions[r2].height = 30
             r2 += 1
     else:
-        s2h(ws2.cell(r2, 1), "No warnings — all signals assigned successfully ✓", C_LGREEN, "FF1E4D2B")
+        s2h(ws2.cell(r2,1), "No warnings — all signals assigned successfully ✓", C_LGREEN, "FF1E4D2B")
         ws2.merge_cells(f"A{r2}:C{r2}")
 
     wb.save(out_path)
     log(f"✓ File saved: {out_path}")
+
+
+# ──────────────────────────────────────────────────────────────
+# EPLAN EXPORT
+# ──────────────────────────────────────────────────────────────
+def generate_eplan_excel(final_rows, hw_config, module_db, out_path, log_fn=None):
+    def log(msg):
+        if log_fn: log_fn(msg)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "EPLAN"
+
+    # Row 1
+    ws["B1"] = "EPLAN Software & Service"
+
+    # Row 2 — headers
+    headers = {
+        "B2": "Function definition",
+        "C2": "Function group",
+        "D2": "Function category",
+        "E2": "DT: Identifier",
+        "F2": "DT: Counter",
+        "G2": "DT: Subcounter",
+        "H2": "Plug designation",
+        "I2": "Function text en_US",
+        "J2": "Symbolic address",
+    }
+    for cell_ref, val in headers.items():
+        ws[cell_ref] = val
+
+    # Column widths
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 14
+    ws.column_dimensions["G"].width = 14
+    ws.column_dimensions["H"].width = 14
+    ws.column_dimensions["I"].width = 50
+    ws.column_dimensions["J"].width = 20
+
+    # Build slot→module-info lookup
+    _, _, slot_lookup = get_rack_module_assignments(hw_config, module_db)
+
+    serial = random.randint(100000, 899999)
+    current_row = 3
+
+    for r in final_rows:
+        if r["_row_type"] != "signal":
+            continue
+
+        sig_type = r["sig_type"]
+        rack_num = r["rack"]
+        slot_num = r["slot"]
+        ch       = r["ch"]
+        rack_name = r.get("rack_name", "")
+
+        # Module info for subcounter
+        mod_entry = slot_lookup.get((rack_name, slot_num), {})
+        mod_idx   = mod_entry.get("mod_idx", 0)
+        subcounter = f"{sig_type}{str(mod_idx).zfill(2)}" if mod_idx else ""
+
+        # DT: Counter  ← rack##.S##
+        dt_counter = f"{str(rack_num).zfill(2)}.S{str(slot_num).zfill(2)}"
+
+        # Plug designation
+        if sig_type in ("DI", "AI"):
+            plug = f"IN {ch}"
+        else:
+            plug = f"OUT {ch}"
+
+        # Function text
+        func_text = f"{r['eq_desc']} – {r['sig_desc']}"
+
+        ws.cell(current_row, 1).value = f"17/{serial:06d}"
+        ws.cell(current_row, 2).value = "2"
+        ws.cell(current_row, 3).value = "1"
+        ws.cell(current_row, 4).value = "300"
+        ws.cell(current_row, 5).value = "R"
+        ws.cell(current_row, 6).value = dt_counter
+        ws.cell(current_row, 7).value = subcounter
+        ws.cell(current_row, 8).value = plug
+        ws.cell(current_row, 9).value = func_text
+        ws.cell(current_row, 10).value = r["tag"]
+
+        serial += 1
+        current_row += 1
+
+    wb.save(out_path)
+    log(f"✓ EPLAN file saved: {out_path} ({current_row - 3} records)")
+
+
+# ──────────────────────────────────────────────────────────────
+# L5X HARDWARE CONFIG GENERATOR
+# ──────────────────────────────────────────────────────────────
+def generate_l5x_files(hw_config, module_db, template_dir, output_dir, sw_revision, log_fn=None):
+    def log(msg):
+        if log_fn: log_fn(msg)
+
+    # Check for missing templates upfront
+    required = set(row["model"] for row in hw_config)
+    missing  = [m for m in required if not os.path.exists(os.path.join(template_dir, f"{m}.L5X"))]
+    if missing:
+        raise ValueError(
+            f"Missing L5X templates for the following modules:\n  " +
+            "\n  ".join(missing) +
+            f"\n\nPlease add the corresponding .L5X files to:\n  {template_dir}"
+        )
+
+    assignments_by_rack, rack_order, _ = get_rack_module_assignments(hw_config, module_db)
+    os.makedirs(output_dir, exist_ok=True)
+
+    for rack_name in rack_order:
+        rack_mods = assignments_by_rack[rack_name]
+        module_blocks = []
+        first_mod_name = None
+
+        for entry in rack_mods:
+            model    = entry["model"]
+            mod_name = entry["name"]
+            slot_num = entry["slot"]
+
+            if first_mod_name is None:
+                first_mod_name = mod_name
+
+            tpl_path = os.path.join(template_dir, f"{model}.L5X")
+            with open(tpl_path, "r", encoding="utf-8-sig") as f:
+                content = f.read()
+
+            # Replace SoftwareRevision (appears once in root element)
+            content = re.sub(r'SoftwareRevision="[^"]*"',
+                             f'SoftwareRevision="{sw_revision}"', content)
+
+            # Replace TargetName in RSLogix5000Content root element
+            content = re.sub(r'TargetName="[^"]*"',
+                             f'TargetName="{mod_name}"', content)
+
+            # Replace Name in Module Use="Target" opening tag
+            content = re.sub(r'(<Module\s+Use="Target"\s+)Name="[^"]*"',
+                             f'\\1Name="{mod_name}"', content)
+
+            # Replace ParentModule
+            content = re.sub(r'ParentModule="[^"]*"',
+                             f'ParentModule="{rack_name}"', content)
+
+            # Replace Address in Port element (slot number)
+            content = re.sub(r'(<Port\s[^>]*)Address="[^"]*"',
+                             f'\\1Address="{slot_num}"', content)
+
+            # Extract the Module block
+            m = re.search(r'<Module\s+Use="Target".*?</Module>', content, re.DOTALL)
+            if m:
+                module_blocks.append(m.group(0))
+            else:
+                log(f"⚠  Could not extract Module block from template: {model}.L5X")
+
+        if not module_blocks:
+            log(f"⚠  No modules for rack {rack_name} — skipped.")
+            continue
+
+        now_str = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+        combined = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            f'<RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="{sw_revision}" '
+            f'TargetName="{first_mod_name}" TargetType="Module" ContainsContext="true" '
+            f'ExportDate="{now_str}" ExportOptions="References NoRawData L5KData DecoratedData '
+            f'Context Dependencies ForceProtectedEncoding AllProjDocTrans">\n'
+            '<Controller Use="Context" Name="C">\n'
+            '<Modules Use="Context">\n'
+        )
+        for block in module_blocks:
+            combined += block + "\n"
+        combined += '</Modules>\n</Controller>\n</RSLogix5000Content>'
+
+        safe_name = rack_name.replace(" ", "_")
+        out_path  = os.path.join(output_dir, f"{safe_name}.L5X")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+        log(f"✓ L5X saved: {os.path.basename(out_path)} ({len(module_blocks)} modules)")
+
+
+# ──────────────────────────────────────────────────────────────
+# TAG OBJECTS EXCEL GENERATOR
+# ──────────────────────────────────────────────────────────────
+def generate_tag_objects(equipment, tag_prefix, out_path, log_fn=None):
+    def log(msg):
+        if log_fn: log_fn(msg)
+
+    BOOL_TYPES = {"DI", "DO"}
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Tags"
+
+    headers = ["Name", "Usage", "Alias For", "Data Type", "Description", "External Access", "Constant"]
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(1, col)
+        c.value = h
+        c.font = Font(name="Arial", size=10, bold=True)
+        c.fill = _fill(C_NAVY)
+        c.border = _border()
+        c.alignment = _align()
+
+    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 50
+    ws.column_dimensions["F"].width = 16
+    ws.row_dimensions[1].height = 20
+
+    current_row = 2
+    for eq in equipment:
+        tag_name = eq["tag"].replace("-", "_").replace(" ", "_")
+        if tag_name and tag_name[0].isdigit():
+            tag_name = tag_prefix + tag_name
+
+        eq_type   = eq["type"]
+        data_type = "BOOL" if eq_type in BOOL_TYPES else eq_type
+
+        row_vals = [tag_name, "Local", 0, data_type, eq["desc"], "Read/Write", 0]
+        for col, val in enumerate(row_vals, 1):
+            c = ws.cell(current_row, col)
+            c.value = val
+            c.font = Font(name="Arial", size=10)
+            c.border = _border()
+            c.alignment = Alignment(horizontal="left" if col in (1,4,5) else "center",
+                                    vertical="center")
+        ws.row_dimensions[current_row].height = 16
+        current_row += 1
+
+    wb.save(out_path)
+    log(f"✓ Tag objects saved: {out_path} ({current_row - 2} tags)")
+
+
+# ──────────────────────────────────────────────────────────────
+# MIRRORING CODE GENERATOR
+# ──────────────────────────────────────────────────────────────
+def generate_mirroring_files(final_rows, plc_attributes, local_racks, code_type, output_dir, log_fn=None):
+    def log(msg):
+        if log_fn: log_fn(msg)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Group signals by rack
+    signals_by_rack = {}
+    for r in final_rows:
+        if r["_row_type"] == "signal":
+            rack_name = r.get("rack_name", "")
+            signals_by_rack.setdefault(rack_name, []).append(r)
+
+    if not signals_by_rack:
+        raise ValueError("No signals found in IO list. Generate the IO list first.")
+
+    if not plc_attributes:
+        raise ValueError("PLC_ATTRIBUTES sheet not found or empty in the input workbook.\n"
+                         "Please add the PLC_ATTRIBUTES sheet with Signal Description and PLC Attribute columns.")
+
+    file_count = 0
+    for rack_name, signals in signals_by_rack.items():
+        adapter = "LOCAL" if rack_name in local_racks else rack_name.replace(" ", "")
+        lines   = []
+
+        for sig in signals:
+            sig_desc = sig["sig_desc"]
+            plc_attr = plc_attributes.get(sig_desc, "")
+            if not plc_attr:
+                continue
+
+            inverted = plc_attr.startswith("!")
+            if inverted:
+                plc_attr = plc_attr[1:]
+
+            tag_name = sig["tag"].replace("-", "_").replace(" ", "_")
+            tag_ref  = f"{tag_name}.{plc_attr}"
+            sig_type = sig["sig_type"]
+            slot     = sig["slot"]
+            ch       = sig["ch"]
+
+            # Physical address
+            if sig_type == "DI":
+                phys = f"{adapter}:{slot}:I.Data.{ch}"
+            elif sig_type == "DO":
+                phys = f"{adapter}:{slot}:O.Data.{ch}"
+            elif sig_type == "AI":
+                phys = f"{adapter}:{slot}:I.Ch{ch}Data"
+            else:  # AO
+                phys = f"{adapter}:{slot}:O.Ch{ch}Data"
+
+            is_input = sig_type in ("DI", "AI")
+
+            if code_type == "ST":
+                if is_input:
+                    stmt = f"{tag_ref} := {'NOT ' if inverted else ''}{phys};"
+                else:
+                    stmt = f"{phys} := {'NOT ' if inverted else ''}{tag_ref};"
+                lines.append(stmt)
+            else:  # Ladder Logic text
+                if sig_type == "DI":
+                    contact = "XIO" if inverted else "XIC"
+                    lines.append(f"{contact}({phys})OTE({tag_ref});")
+                elif sig_type == "DO":
+                    contact = "XIO" if inverted else "XIC"
+                    lines.append(f"{contact}({tag_ref})OTE({phys});")
+                elif sig_type == "AI":
+                    src = f"NOT {phys}" if inverted else phys
+                    lines.append(f"COP({src},{tag_ref},1);")
+                else:  # AO
+                    src = f"NOT {tag_ref}" if inverted else tag_ref
+                    lines.append(f"COP({src},{phys},1);")
+
+        if not lines:
+            log(f"⚠  No mapped signals for rack {rack_name} — file skipped.")
+            continue
+
+        safe_name = rack_name.replace(" ", "_")
+        ext       = "st" if code_type == "ST" else "txt"
+        out_path  = os.path.join(output_dir, f"{safe_name}_Mirror.{ext}")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        log(f"✓ Mirror saved: {os.path.basename(out_path)} ({len(lines)} statements)")
+        file_count += 1
+
+    if file_count == 0:
+        raise ValueError("No mirroring files generated. Check that PLC_ATTRIBUTES contains "
+                         "Signal Description values that match signals in your equipment list.")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -845,155 +1121,340 @@ class App(tk.Tk):
         super().__init__()
         self.title("IO List Generator — Allen-Bradley / Rockwell")
         self.resizable(True, True)
-        self.minsize(680, 640)
-        self.input_path = None
+        self.minsize(820, 700)
+        self.input_path    = None
         self.rev_file_path = None
+        self.eplan_out_path = None
+        self.tags_out_path  = None
+        self.rack_local_vars = {}
+        self._racks_chk_frame = None
+        # store final_rows between IO list generation and other generators
+        self._last_final_rows = None
+        self._last_hw_config  = None
+        self._last_module_db  = None
+        self._last_equipment  = None
+        self._last_plc_attrs  = None
         self._build_ui()
         self._center()
 
     def _center(self):
         self.update_idletasks()
-        w, h = 780, 680
+        w, h = 920, 760
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
 
+    # ── Build UI ────────────────────────────────────────────
     def _build_ui(self):
-        FONT_H  = ("Arial", 11, "bold")
-        FONT_B  = ("Arial", 10)
-        FONT_SM = ("Arial", 9)
-        BG_MAIN = "#f5f5f5"
-        BG_NAV  = "#c0c0c0"
-        FG_NAV  = "#000000"
-
-        self.configure(bg=BG_MAIN)
+        FH  = ("Arial", 11, "bold")
+        FB  = ("Arial", 10)
+        FSM = ("Arial", 9)
+        BG  = "#f5f5f5"
+        BN  = "#c0c0c0"
+        FN  = "#000000"
+        self.configure(bg=BG)
 
         # Title bar
-        title_frame = tk.Frame(self, bg=BG_NAV, height=52)
-        title_frame.pack(fill="x")
-        title_frame.pack_propagate(False)
-        tk.Label(title_frame, text="  IO List Generator", font=("Arial", 14, "bold"),
-                 bg=BG_NAV, fg=FG_NAV, anchor="w").pack(side="left", padx=10, pady=10)
-        tk.Label(title_frame, text="Allen-Bradley / Rockwell Automation",
-                 font=("Arial", 9), bg=BG_NAV, fg="#444444").pack(side="left", padx=2)
+        tf = tk.Frame(self, bg=BN, height=52)
+        tf.pack(fill="x")
+        tf.pack_propagate(False)
+        tk.Label(tf, text="  IO List Generator", font=("Arial",14,"bold"),
+                 bg=BN, fg=FN, anchor="w").pack(side="left", padx=10, pady=10)
+        tk.Label(tf, text="Allen-Bradley / Rockwell Automation",
+                 font=("Arial",9), bg=BN, fg="#444").pack(side="left", padx=2)
 
-        # Main content
-        content = tk.Frame(self, bg=BG_MAIN, padx=18, pady=14)
-        content.pack(fill="both", expand=True)
-
-        # ── Step 1: Input file ──
-        self._section(content, "1  Select Input Workbook", FONT_H)
-        file_row = tk.Frame(content, bg=BG_MAIN)
-        file_row.pack(fill="x", pady=(0, 10))
-        self.lbl_file = tk.Label(file_row, text="No file selected", font=FONT_SM,
-                                 bg="#e8eef4", fg="#444", relief="flat",
-                                 anchor="w", padx=8, pady=5)
+        # Common: input file
+        cf = tk.Frame(self, bg=BG, padx=16, pady=8)
+        cf.pack(fill="x")
+        self._sec(cf, "Input Workbook", FH)
+        fr = tk.Frame(cf, bg=BG)
+        fr.pack(fill="x", pady=(0,4))
+        self.lbl_file = tk.Label(fr, text="No file selected", font=FSM,
+                                 bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
         self.lbl_file.pack(side="left", fill="x", expand=True)
-        tk.Button(file_row, text="Browse…", font=FONT_B, bg=BG_NAV, fg=FG_NAV,
-                  relief="flat", padx=14, pady=4, cursor="hand2",
-                  command=self._browse_input).pack(side="left", padx=(6, 0))
-        tk.Button(file_row, text="Create template", font=FONT_SM, bg="#f0c040", fg="#1a1a1a",
+        tk.Button(fr, text="Browse…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2", command=self._browse_input).pack(side="left", padx=(6,0))
+        tk.Button(fr, text="Create template", font=FSM, bg="#f0c040", fg="#1a1a1a",
                   relief="flat", padx=10, pady=4, cursor="hand2",
-                  command=self._create_template).pack(side="left", padx=(6, 0))
+                  command=self._create_template).pack(side="left", padx=(6,0))
 
-        # ── Step 2: Revision mode ──
-        self._section(content, "2  Revision Mode (optional)", FONT_H)
-        rev_check_row = tk.Frame(content, bg=BG_MAIN)
-        rev_check_row.pack(fill="x", pady=(0, 4))
-        self.revision_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(rev_check_row,
-                       text="Enable revision mode — attach a manufacturing IO list to update assignments",
-                       variable=self.revision_var,
-                       command=self._toggle_revision,
-                       font=FONT_B, bg=BG_MAIN, fg="#1a1a1a",
-                       activebackground=BG_MAIN).pack(side="left")
+        # Main notebook
+        style = ttk.Style()
+        style.configure("TNotebook", background=BG)
+        style.configure("TNotebook.Tab", font=FB, padding=[12,4])
 
-        rev_attach_row = tk.Frame(content, bg=BG_MAIN)
-        rev_attach_row.pack(fill="x", pady=(0, 10))
-        self.lbl_rev_file = tk.Label(rev_attach_row, text="No manufacturing IO list attached",
-                                     font=FONT_SM, bg="#e8eef4", fg="#888", relief="flat",
-                                     anchor="w", padx=8, pady=5)
-        self.lbl_rev_file.pack(side="left", fill="x", expand=True)
-        self.btn_rev_attach = tk.Button(rev_attach_row, text="Attach…", font=FONT_B,
-                                        bg="#888888", fg="white", relief="flat",
-                                        padx=14, pady=4, cursor="hand2",
-                                        command=self._browse_rev_file, state="disabled")
-        self.btn_rev_attach.pack(side="left", padx=(6, 0))
+        mnb = ttk.Notebook(self)
+        mnb.pack(fill="both", expand=True, padx=10, pady=2)
 
-        # ── Step 3: Output folder ──
-        self._section(content, "3  Output Folder", FONT_H)
-        out_row = tk.Frame(content, bg=BG_MAIN)
-        out_row.pack(fill="x", pady=(0, 10))
-        self.out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "IO List")
-        self.lbl_out = tk.Label(out_row, text=self.out_dir, font=FONT_SM,
-                                bg="#e8eef4", fg="#444", relief="flat",
-                                anchor="w", padx=8, pady=5)
-        self.lbl_out.pack(side="left", fill="x", expand=True)
-        tk.Button(out_row, text="Change…", font=FONT_B, bg=BG_NAV, fg=FG_NAV,
-                  relief="flat", padx=14, pady=4, cursor="hand2",
-                  command=self._browse_out).pack(side="left", padx=(6, 0))
+        dt = tk.Frame(mnb, bg=BG)
+        mnb.add(dt, text="  Design Team  ")
+        self._build_design_tab(dt, FH, FB, FSM, BG, BN, FN)
 
-        # ── Generate button ──
-        gen_frame = tk.Frame(content, bg=BG_MAIN)
-        gen_frame.pack(fill="x", pady=(6, 10))
-        self.btn_gen = tk.Button(gen_frame, text="▶  Generate IO List", font=("Arial", 11, "bold"),
-                                 bg="#1E7C3A", fg="white", relief="flat",
-                                 padx=22, pady=8, cursor="hand2",
-                                 command=self._run_generate)
-        self.btn_gen.pack(side="left")
-        self.btn_open = tk.Button(gen_frame, text="Open output folder", font=FONT_B,
-                                  bg=BG_NAV, fg=FG_NAV, relief="flat",
-                                  padx=14, pady=8, cursor="hand2",
-                                  command=self._open_out_folder, state="disabled")
-        self.btn_open.pack(side="left", padx=(10, 0))
+        at = tk.Frame(mnb, bg=BG)
+        mnb.add(at, text="  Automation Team  ")
+        self._build_auto_tab(at, FH, FB, FSM, BG, BN, FN)
 
-        # ── Progress bar ──
-        self.progress = ttk.Progressbar(content, mode="indeterminate", length=300)
-        self.progress.pack(fill="x", pady=(0, 6))
+        # Progress + log
+        self.progress = ttk.Progressbar(self, mode="indeterminate")
+        self.progress.pack(fill="x", padx=10, pady=(2,0))
 
-        # ── Log box ──
-        self._section(content, "Log", FONT_H)
-        self.log_box = scrolledtext.ScrolledText(content, height=11, font=("Courier New", 9),
-                                                 bg="#1a1a2e", fg="#d0e8ff",
-                                                 relief="flat", padx=8, pady=6,
-                                                 insertbackground="white")
+        lf = tk.Frame(self, bg=BG, padx=10, pady=4)
+        lf.pack(fill="both", expand=False)
+        tk.Label(lf, text="Log", font=FH, bg=BG, fg="#333", anchor="w").pack(fill="x")
+        self.log_box = scrolledtext.ScrolledText(lf, height=7, font=("Courier New",9),
+                                                  bg="#1a1a2e", fg="#d0e8ff", relief="flat",
+                                                  padx=8, pady=6, insertbackground="white")
         self.log_box.pack(fill="both", expand=True)
         self.log_box.configure(state="disabled")
 
-        # Status bar
         self.status_var = tk.StringVar(value="Ready")
-        tk.Label(self, textvariable=self.status_var, font=FONT_SM,
-                 bg=BG_NAV, fg=FG_NAV, anchor="w", padx=10).pack(
-                 side="bottom", fill="x")
+        tk.Label(self, textvariable=self.status_var, font=FSM,
+                 bg=BN, fg=FN, anchor="w", padx=10).pack(side="bottom", fill="x")
 
-    def _section(self, parent, text, font):
-        tk.Frame(parent, bg="#d0d0d0", height=1).pack(fill="x", pady=(4, 2))
-        tk.Label(parent, text=text, font=font, bg="#f5f5f5", fg="#333333",
-                 anchor="w").pack(fill="x")
+    def _sec(self, parent, text, font):
+        tk.Frame(parent, bg="#c8c8c8", height=1).pack(fill="x", pady=(4,2))
+        tk.Label(parent, text=text, font=font, bg="#f5f5f5", fg="#222", anchor="w").pack(fill="x")
 
+    # ── Design Team tab ─────────────────────────────────────
+    def _build_design_tab(self, parent, FH, FB, FSM, BG, BN, FN):
+        dnb = ttk.Notebook(parent)
+        dnb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        ef = tk.Frame(dnb, bg=BG, padx=14, pady=10)
+        dnb.add(ef, text="  EPLAN Export  ")
+
+        self._sec(ef, "EPLAN Import-Ready Excel", FH)
+        tk.Label(ef, text="Generates one row per IO signal, ready for EPLAN import.",
+                 font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        er = tk.Frame(ef, bg=BG)
+        er.pack(fill="x", pady=(0,8))
+        tk.Label(er, text="Output file:", font=FB, bg=BG).pack(side="left")
+        self.lbl_eplan = tk.Label(er, text="Not set", font=FSM,
+                                  bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
+        self.lbl_eplan.pack(side="left", fill="x", expand=True, padx=(6,0))
+        tk.Button(er, text="Browse…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2",
+                  command=self._browse_eplan_out).pack(side="left", padx=(6,0))
+
+        tk.Button(ef, text="▶  Generate EPLAN File", font=("Arial",11,"bold"),
+                  bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
+                  command=self._run_eplan).pack(anchor="w", pady=(8,0))
+
+    # ── Automation Team tab ──────────────────────────────────
+    def _build_auto_tab(self, parent, FH, FB, FSM, BG, BN, FN):
+        anb = ttk.Notebook(parent)
+        anb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # IO List sub-tab
+        ilf = tk.Frame(anb, bg=BG, padx=14, pady=10)
+        anb.add(ilf, text="  IO List  ")
+        self._build_iolist_sub(ilf, FH, FB, FSM, BG, BN, FN)
+
+        # L5X sub-tab
+        lf = tk.Frame(anb, bg=BG, padx=14, pady=10)
+        anb.add(lf, text="  L5X Hardware  ")
+        self._build_l5x_sub(lf, FH, FB, FSM, BG, BN, FN)
+
+        # Tags sub-tab
+        tf = tk.Frame(anb, bg=BG, padx=14, pady=10)
+        anb.add(tf, text="  Tag Objects  ")
+        self._build_tags_sub(tf, FH, FB, FSM, BG, BN, FN)
+
+        # Mirroring sub-tab
+        mf = tk.Frame(anb, bg=BG, padx=14, pady=10)
+        anb.add(mf, text="  Mirroring  ")
+        self._build_mirror_sub(mf, FH, FB, FSM, BG, BN, FN)
+
+    def _build_iolist_sub(self, p, FH, FB, FSM, BG, BN, FN):
+        self._sec(p, "Revision Mode (optional)", FH)
+        rv = tk.Frame(p, bg=BG)
+        rv.pack(fill="x", pady=(0,4))
+        self.revision_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(rv, text="Enable revision mode — attach a manufacturing IO list",
+                       variable=self.revision_var, command=self._toggle_revision,
+                       font=FB, bg=BG, activebackground=BG).pack(side="left")
+        ra = tk.Frame(p, bg=BG)
+        ra.pack(fill="x", pady=(0,10))
+        self.lbl_rev_file = tk.Label(ra, text="No manufacturing IO list attached",
+                                     font=FSM, bg="#e8eef4", fg="#888", relief="flat",
+                                     anchor="w", padx=8, pady=5)
+        self.lbl_rev_file.pack(side="left", fill="x", expand=True)
+        self.btn_rev_attach = tk.Button(ra, text="Attach…", font=FB, bg="#888", fg="white",
+                                        relief="flat", padx=14, pady=4, cursor="hand2",
+                                        command=self._browse_rev_file, state="disabled")
+        self.btn_rev_attach.pack(side="left", padx=(6,0))
+
+        self._sec(p, "Output Folder", FH)
+        orf = tk.Frame(p, bg=BG)
+        orf.pack(fill="x", pady=(0,10))
+        self.out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "IO List")
+        self.lbl_out = tk.Label(orf, text=self.out_dir, font=FSM,
+                                bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
+        self.lbl_out.pack(side="left", fill="x", expand=True)
+        tk.Button(orf, text="Change…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2", command=self._browse_out).pack(side="left", padx=(6,0))
+
+        bf = tk.Frame(p, bg=BG)
+        bf.pack(fill="x", pady=(6,10))
+        self.btn_gen = tk.Button(bf, text="▶  Generate IO List", font=("Arial",11,"bold"),
+                                 bg="#1E7C3A", fg="white", relief="flat",
+                                 padx=22, pady=8, cursor="hand2", command=self._run_generate)
+        self.btn_gen.pack(side="left")
+        self.btn_open = tk.Button(bf, text="Open output folder", font=FB, bg=BN, fg=FN,
+                                  relief="flat", padx=14, pady=8, cursor="hand2",
+                                  command=self._open_out_folder, state="disabled")
+        self.btn_open.pack(side="left", padx=(10,0))
+
+    def _build_l5x_sub(self, p, FH, FB, FSM, BG, BN, FN):
+        self._sec(p, "Studio 5000 Hardware Configuration", FH)
+        tk.Label(p, text="Generates one L5X file per rack for import into Studio 5000 Logix Designer.",
+                 font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        sr = tk.Frame(p, bg=BG)
+        sr.pack(fill="x", pady=(0,8))
+        tk.Label(sr, text="Software Revision:", font=FB, bg=BG).pack(side="left")
+        self.l5x_sw_rev = tk.StringVar(value="33.04")
+        tk.Entry(sr, textvariable=self.l5x_sw_rev, font=FB, width=10,
+                 relief="flat", bg="#e8eef4").pack(side="left", padx=(8,0), ipady=3)
+
+        tpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ModuleL5K")
+        tk.Label(p, text=f"Templates folder:  {tpl_dir}", font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        self._sec(p, "Output Folder", FH)
+        of = tk.Frame(p, bg=BG)
+        of.pack(fill="x", pady=(0,10))
+        self.l5x_out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "L5X Output")
+        self.lbl_l5x_out = tk.Label(of, text=self.l5x_out_dir, font=FSM,
+                                     bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
+        self.lbl_l5x_out.pack(side="left", fill="x", expand=True)
+        tk.Button(of, text="Change…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2", command=self._browse_l5x_out).pack(side="left", padx=(6,0))
+
+        tk.Button(p, text="▶  Generate L5X Files", font=("Arial",11,"bold"),
+                  bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
+                  command=self._run_l5x).pack(anchor="w", pady=(8,0))
+
+    def _build_tags_sub(self, p, FH, FB, FSM, BG, BN, FN):
+        self._sec(p, "Studio 5000 Tag Objects", FH)
+        tk.Label(p, text="Generates an Excel file with equipment tag definitions for Studio 5000 import.",
+                 font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        pr = tk.Frame(p, bg=BG)
+        pr.pack(fill="x", pady=(0,8))
+        tk.Label(pr, text="Prefix for tags starting with a number:", font=FB, bg=BG).pack(side="left")
+        self.tag_prefix_var = tk.StringVar(value="")
+        tk.Entry(pr, textvariable=self.tag_prefix_var, font=FB, width=8,
+                 relief="flat", bg="#e8eef4").pack(side="left", padx=(8,0), ipady=3)
+        tk.Label(pr, text="(leave blank if not needed)", font=FSM, bg=BG, fg="#888").pack(side="left", padx=(6,0))
+
+        self._sec(p, "Output File", FH)
+        of = tk.Frame(p, bg=BG)
+        of.pack(fill="x", pady=(0,10))
+        self.lbl_tags = tk.Label(of, text="Not set", font=FSM,
+                                  bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
+        self.lbl_tags.pack(side="left", fill="x", expand=True)
+        tk.Button(of, text="Browse…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2", command=self._browse_tags_out).pack(side="left", padx=(6,0))
+
+        tk.Button(p, text="▶  Generate Tag Objects", font=("Arial",11,"bold"),
+                  bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
+                  command=self._run_tags).pack(anchor="w", pady=(8,0))
+
+    def _build_mirror_sub(self, p, FH, FB, FSM, BG, BN, FN):
+        self._sec(p, "PLC Mirroring Code", FH)
+        tk.Label(p, text="Generates mirroring statements linking physical IO addresses to PLC tag objects.",
+                 font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        # Code type
+        cr = tk.Frame(p, bg=BG)
+        cr.pack(fill="x", pady=(0,8))
+        tk.Label(cr, text="Code type:", font=FB, bg=BG).pack(side="left")
+        self.mirror_code_type = tk.StringVar(value="ST")
+        tk.Radiobutton(cr, text="Structured Text (IEC 61131-3 ST)", variable=self.mirror_code_type,
+                       value="ST", font=FB, bg=BG, activebackground=BG).pack(side="left", padx=(8,0))
+        tk.Radiobutton(cr, text="Ladder Logic", variable=self.mirror_code_type,
+                       value="LL", font=FB, bg=BG, activebackground=BG).pack(side="left", padx=(8,0))
+
+        # LOCAL racks
+        self._sec(p, "LOCAL Racks", FH)
+        tk.Label(p, text="Check racks that are in the same chassis as the controller (LOCAL):",
+                 font=FSM, bg=BG, fg="#555").pack(anchor="w")
+        rack_outer = tk.Frame(p, bg=BG)
+        rack_outer.pack(fill="x", pady=(4,8))
+        self._racks_chk_frame = tk.Frame(rack_outer, bg="#e8eef4", relief="flat", padx=8, pady=6)
+        self._racks_chk_frame.pack(side="left")
+        tk.Label(self._racks_chk_frame, text="Browse an input file to see racks",
+                 font=FSM, bg="#e8eef4", fg="#888").pack()
+
+        # Output folder
+        self._sec(p, "Output Folder", FH)
+        of = tk.Frame(p, bg=BG)
+        of.pack(fill="x", pady=(0,10))
+        self.mirror_out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Mirroring")
+        self.lbl_mirror_out = tk.Label(of, text=self.mirror_out_dir, font=FSM,
+                                        bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
+        self.lbl_mirror_out.pack(side="left", fill="x", expand=True)
+        tk.Button(of, text="Change…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2", command=self._browse_mirror_out).pack(side="left", padx=(6,0))
+
+        tk.Button(p, text="▶  Generate Mirroring Files", font=("Arial",11,"bold"),
+                  bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
+                  command=self._run_mirroring).pack(anchor="w", pady=(8,0))
+
+    # ── Helpers ─────────────────────────────────────────────
     def _toggle_revision(self):
         if self.revision_var.get():
             self.btn_rev_attach.configure(state="normal", bg="#595959")
             self.lbl_rev_file.configure(fg="#444")
         else:
-            self.btn_rev_attach.configure(state="disabled", bg="#888888")
+            self.btn_rev_attach.configure(state="disabled", bg="#888")
             self.lbl_rev_file.configure(text="No manufacturing IO list attached", fg="#888")
             self.rev_file_path = None
 
+    def _log(self, msg):
+        self.log_box.configure(state="normal")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_box.insert("end", f"[{ts}]  {msg}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+        self.update_idletasks()
+
+    def _set_status(self, msg):
+        self.status_var.set(msg)
+
+    def _update_rack_checkboxes(self):
+        if not self.input_path or not self._racks_chk_frame:
+            return
+        racks = _quick_read_racks(self.input_path)
+        for w in self._racks_chk_frame.winfo_children():
+            w.destroy()
+        self.rack_local_vars = {}
+        if not racks:
+            tk.Label(self._racks_chk_frame, text="No racks found",
+                     font=("Arial",9), bg="#e8eef4", fg="#888").pack()
+            return
+        for rack in racks:
+            var = tk.BooleanVar(value=False)
+            self.rack_local_vars[rack] = var
+            tk.Checkbutton(self._racks_chk_frame, text=rack, variable=var,
+                           font=("Arial",10), bg="#e8eef4",
+                           activebackground="#e8eef4").pack(anchor="w")
+
+    # ── Browse handlers ──────────────────────────────────────
     def _browse_input(self):
         path = filedialog.askopenfilename(
             title="Select Input Workbook",
-            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")]
-        )
+            filetypes=[("Excel files","*.xlsx *.xlsm"),("All files","*.*")])
         if path:
             self.input_path = path
             self.lbl_file.configure(text=f"  {os.path.basename(path)}  ({path})")
+            self._update_rack_checkboxes()
 
     def _browse_rev_file(self):
         path = filedialog.askopenfilename(
             title="Select Manufacturing IO List",
-            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")]
-        )
+            filetypes=[("Excel files","*.xlsx *.xlsm"),("All files","*.*")])
         if path:
             self.rev_file_path = path
             self.lbl_rev_file.configure(text=f"  {os.path.basename(path)}  ({path})")
@@ -1003,6 +1464,36 @@ class App(tk.Tk):
         if d:
             self.out_dir = d
             self.lbl_out.configure(text=d)
+
+    def _browse_eplan_out(self):
+        path = filedialog.asksaveasfilename(
+            title="Save EPLAN File As", defaultextension=".xlsx",
+            initialfile="EPLAN_Export.xlsx",
+            filetypes=[("Excel files","*.xlsx")])
+        if path:
+            self.eplan_out_path = path
+            self.lbl_eplan.configure(text=f"  {os.path.basename(path)}  ({path})")
+
+    def _browse_l5x_out(self):
+        d = filedialog.askdirectory(title="Select L5X Output Folder", initialdir=self.l5x_out_dir)
+        if d:
+            self.l5x_out_dir = d
+            self.lbl_l5x_out.configure(text=d)
+
+    def _browse_tags_out(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Tag Objects File As", defaultextension=".xlsx",
+            initialfile="Tag_Objects.xlsx",
+            filetypes=[("Excel files","*.xlsx")])
+        if path:
+            self.tags_out_path = path
+            self.lbl_tags.configure(text=f"  {os.path.basename(path)}  ({path})")
+
+    def _browse_mirror_out(self):
+        d = filedialog.askdirectory(title="Select Mirroring Output Folder", initialdir=self.mirror_out_dir)
+        if d:
+            self.mirror_out_dir = d
+            self.lbl_mirror_out.configure(text=d)
 
     def _open_out_folder(self):
         import subprocess, platform
@@ -1016,87 +1507,80 @@ class App(tk.Tk):
         except:
             pass
 
-    def _log(self, msg):
-        self.log_box.configure(state="normal")
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{ts}]  {msg}\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
-        self.update_idletasks()
-
-    def _set_status(self, msg):
-        self.status_var.set(msg)
-
     def _create_template(self):
         from create_template import main as make_tpl
         save_path = filedialog.asksaveasfilename(
-            title="Save Input Template As",
-            defaultextension=".xlsx",
+            title="Save Input Template As", defaultextension=".xlsx",
             initialfile="IO_List_Input_Template.xlsx",
-            filetypes=[("Excel files", "*.xlsx")]
-        )
+            filetypes=[("Excel files","*.xlsx")])
         if not save_path:
             return
         try:
             make_tpl(save_path)
             messagebox.showinfo("Template created",
-                                f"Template saved to:\n{save_path}\n\n"
-                                "Fill in all sheets then run Generate.")
+                                f"Template saved to:\n{save_path}\n\nFill in all sheets then run Generate.")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def _run_generate(self):
+    def _require_input(self):
         if not self.input_path:
             messagebox.showwarning("No input file", "Please select the input workbook first.")
-            return
+            return False
+        return True
 
+    def _start_task(self):
+        self.progress.start(12)
+
+    def _stop_task(self, status="Done"):
+        self.progress.stop()
+        self._set_status(status)
+
+    # ── IO List generation ───────────────────────────────────
+    def _run_generate(self):
+        if not self._require_input():
+            return
         revision_mode = self.revision_var.get()
         if revision_mode and not self.rev_file_path:
             messagebox.showwarning("No manufacturing IO list",
-                                   "Revision mode is enabled.\n"
-                                   "Please attach the manufacturing IO list before generating.")
+                                   "Revision mode is enabled.\nPlease attach the manufacturing IO list.")
             return
-
         os.makedirs(self.out_dir, exist_ok=True)
         self.btn_gen.configure(state="disabled")
-        self.progress.start(12)
-        self._set_status("Generating…")
+        self._start_task()
+        self._set_status("Generating IO list…")
 
         def task():
             try:
-                self._log(f"Reading workbook: {os.path.basename(self.input_path)}")
-                proj, module_db, hw_config, eq_types, matrix, sig_order, equipment = \
+                self._log(f"Reading: {os.path.basename(self.input_path)}")
+                proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, plc_attrs = \
                     read_workbook(self.input_path)
-
-                self._log(f"Project: {proj.get('Project Name', '?')}  |  "
-                          f"Equipment items: {len(equipment)}")
+                self._log(f"Project: {proj.get('Project Name','?')} | Equipment: {len(equipment)}")
 
                 if revision_mode:
-                    self._log(f"Revision mode — parsing: {os.path.basename(self.rev_file_path)}")
-                    mfg_channels = parse_manufacturing_io_list(self.rev_file_path)
-                    self._log(f"Manufacturing IO list: {len(mfg_channels)} channels found")
+                    self._log(f"Revision — parsing: {os.path.basename(self.rev_file_path)}")
+                    mfg = parse_manufacturing_io_list(self.rev_file_path)
+                    self._log(f"Manufacturing IO list: {len(mfg)} channels")
                     final_rows, counts, warnings = build_io_list_revision(
-                        proj, module_db, mfg_channels, eq_types, matrix, sig_order, equipment,
-                        log_fn=self._log
-                    )
+                        proj, module_db, mfg, eq_types, matrix, sig_order, equipment, self._log)
                 else:
-                    self._log(f"Racks configured: {len(set(r['rack'] for r in hw_config))}  |  "
-                              f"Module rows: {len(hw_config)}  |  Signal rows: {len(sig_order)}")
+                    self._log(f"Racks: {len(set(r['rack'] for r in hw_config))} | Modules: {len(hw_config)} | Signals: {len(sig_order)}")
                     final_rows, counts, warnings = build_io_list(
-                        proj, module_db, hw_config, eq_types, matrix, sig_order, equipment,
-                        log_fn=self._log
-                    )
+                        proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, self._log)
 
-                now = datetime.now()
-                proj_name = proj.get("Project Name", "Project").replace(" ", "_")
-                suffix = "_Revision" if revision_mode else ""
-                fname = f"{proj_name}_{now.strftime('%Y%m%d_%H%M%S')}{suffix}_IO_List.xlsx"
+                # Store for other generators
+                self._last_final_rows = final_rows
+                self._last_hw_config  = hw_config
+                self._last_module_db  = module_db
+                self._last_equipment  = equipment
+                self._last_plc_attrs  = plc_attrs
+
+                now  = datetime.now()
+                name = proj.get("Project Name","Project").replace(" ","_")
+                sfx  = "_Revision" if revision_mode else ""
+                fname = f"{name}_{now.strftime('%Y%m%d_%H%M%S')}{sfx}_IO_List.xlsx"
                 out_path = os.path.join(self.out_dir, fname)
-
-                write_output(proj, module_db, final_rows, counts, warnings, out_path,
-                             log_fn=self._log)
-                self.after(0, lambda: self._on_done(out_path, warnings))
-
+                write_output(proj, module_db, final_rows, counts, warnings, out_path, self._log)
+                self.after(0, lambda: self._on_done_io(out_path, warnings))
             except Exception as e:
                 import traceback
                 self._log(f"✗ ERROR: {e}")
@@ -1105,24 +1589,130 @@ class App(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _on_done(self, out_path, warnings):
-        self.progress.stop()
+    def _on_done_io(self, out_path, warnings):
+        self._stop_task(f"Done — {os.path.basename(out_path)}")
         self.btn_gen.configure(state="normal")
         self.btn_open.configure(state="normal")
-        self._set_status(f"Done — {os.path.basename(out_path)}")
         if warnings:
             messagebox.showwarning("Completed with warnings",
                                    f"IO List generated with {len(warnings)} warning(s).\n"
-                                   f"Check the 'Generation Summary' sheet for details.\n\n"
-                                   f"File: {os.path.basename(out_path)}")
+                                   f"Check 'Generation Summary' sheet.\n\nFile: {os.path.basename(out_path)}")
         else:
-            messagebox.showinfo("Success",
-                                f"IO List generated successfully!\n\nFile: {os.path.basename(out_path)}")
+            messagebox.showinfo("Success", f"IO List generated!\n\nFile: {os.path.basename(out_path)}")
+
+    # ── EPLAN generation ─────────────────────────────────────
+    def _run_eplan(self):
+        if not self._require_input():
+            return
+        if not self.eplan_out_path:
+            messagebox.showwarning("No output file", "Please select an output file path first.")
+            return
+        self._start_task()
+        self._set_status("Generating EPLAN file…")
+
+        def task():
+            try:
+                self._log(f"Reading: {os.path.basename(self.input_path)}")
+                proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, plc_attrs = \
+                    read_workbook(self.input_path)
+                final_rows, _, _ = build_io_list(
+                    proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, self._log)
+                generate_eplan_excel(final_rows, hw_config, module_db, self.eplan_out_path, self._log)
+                self.after(0, lambda: self._on_done_simple("EPLAN", self.eplan_out_path))
+            except Exception as e:
+                import traceback
+                self._log(f"✗ ERROR: {e}")
+                self._log(traceback.format_exc())
+                self.after(0, lambda: self._on_error(str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── L5X generation ───────────────────────────────────────
+    def _run_l5x(self):
+        if not self._require_input():
+            return
+        tpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ModuleL5K")
+        self._start_task()
+        self._set_status("Generating L5X files…")
+
+        def task():
+            try:
+                self._log(f"Reading: {os.path.basename(self.input_path)}")
+                _, module_db, hw_config, _, _, _, _, _ = read_workbook(self.input_path)
+                generate_l5x_files(hw_config, module_db, tpl_dir,
+                                   self.l5x_out_dir, self.l5x_sw_rev.get(), self._log)
+                self.after(0, lambda: self._on_done_folder("L5X", self.l5x_out_dir))
+            except Exception as e:
+                import traceback
+                self._log(f"✗ ERROR: {e}")
+                self._log(traceback.format_exc())
+                self.after(0, lambda: self._on_error(str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── Tag objects generation ───────────────────────────────
+    def _run_tags(self):
+        if not self._require_input():
+            return
+        if not self.tags_out_path:
+            messagebox.showwarning("No output file", "Please select an output file path first.")
+            return
+        tag_prefix = self.tag_prefix_var.get().strip()
+        self._start_task()
+        self._set_status("Generating tag objects…")
+
+        def task():
+            try:
+                self._log(f"Reading: {os.path.basename(self.input_path)}")
+                _, _, _, _, _, _, equipment, _ = read_workbook(self.input_path)
+                generate_tag_objects(equipment, tag_prefix, self.tags_out_path, self._log)
+                self.after(0, lambda: self._on_done_simple("Tag Objects", self.tags_out_path))
+            except Exception as e:
+                import traceback
+                self._log(f"✗ ERROR: {e}")
+                self._log(traceback.format_exc())
+                self.after(0, lambda: self._on_error(str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── Mirroring generation ─────────────────────────────────
+    def _run_mirroring(self):
+        if not self._require_input():
+            return
+        local_racks = {r for r, v in self.rack_local_vars.items() if v.get()}
+        code_type   = self.mirror_code_type.get()
+        self._start_task()
+        self._set_status("Generating mirroring files…")
+
+        def task():
+            try:
+                self._log(f"Reading: {os.path.basename(self.input_path)}")
+                proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, plc_attrs = \
+                    read_workbook(self.input_path)
+                final_rows, _, _ = build_io_list(
+                    proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, self._log)
+                generate_mirroring_files(final_rows, plc_attrs, local_racks,
+                                         code_type, self.mirror_out_dir, self._log)
+                self.after(0, lambda: self._on_done_folder("Mirroring", self.mirror_out_dir))
+            except Exception as e:
+                import traceback
+                self._log(f"✗ ERROR: {e}")
+                self._log(traceback.format_exc())
+                self.after(0, lambda: self._on_error(str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── Done/Error callbacks ─────────────────────────────────
+    def _on_done_simple(self, label, path):
+        self._stop_task(f"{label} done — {os.path.basename(path)}")
+        messagebox.showinfo("Success", f"{label} file generated!\n\nFile: {path}")
+
+    def _on_done_folder(self, label, folder):
+        self._stop_task(f"{label} done — {folder}")
+        messagebox.showinfo("Success", f"{label} files generated!\n\nFolder: {folder}")
 
     def _on_error(self, msg):
-        self.progress.stop()
-        self.btn_gen.configure(state="normal")
-        self._set_status("Error — see log")
+        self._stop_task("Error — see log")
         messagebox.showerror("Generation failed", f"An error occurred:\n\n{msg}\n\nSee log for details.")
 
 

@@ -1,0 +1,49 @@
+﻿<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="33.04" TargetName="DI_01" TargetType="Module" ContainsContext="true" ExportDate="Wed Apr 22 10:40:46 2026" ExportOptions="References NoRawData L5KData DecoratedData Context Dependencies ForceProtectedEncoding AllProjDocTrans">
+<Controller Use="Context" Name="C">
+<Modules Use="Context">
+<Module Use="Target" Name="DI_01" CatalogNumber="1734-IB8/C" Vendor="1" ProductType="7" ProductCode="216" Major="3" Minor="1" ParentModule="RACK01" ParentModPortId="1" Inhibited="false"
+ MajorFault="false">
+<EKey State="CompatibleModule"/>
+<Ports>
+<Port Id="1" Address="1" Type="PointIO" Upstream="true"/>
+</Ports>
+<Communications CommMethod="1073741824">
+<ConfigTag ConfigSize="36" ExternalAccess="Read/Write">
+<Data Format="L5K">
+<![CDATA[[40,103,1,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000]]]>
+</Data>
+<Data Format="Decorated">
+<Structure DataType="AB:1734_DI8:C:0">
+<DataValueMember Name="Pt0FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt0FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt1FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt1FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt2FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt2FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt3FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt3FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt4FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt4FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt5FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt5FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt6FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt6FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt7FilterOffOn" DataType="INT" Radix="Decimal" Value="1000"/>
+<DataValueMember Name="Pt7FilterOnOff" DataType="INT" Radix="Decimal" Value="1000"/>
+</Structure>
+</Data>
+</ConfigTag>
+<Connections>
+<RackConnection>
+<InAliasTag/>
+</RackConnection>
+</Connections>
+</Communications>
+<ExtendedProperties>
+<public><ConfigID>262147</ConfigID><CatNum>1734-IB8</CatNum></public>
+</ExtendedProperties>
+</Module>
+</Modules>
+</Controller>
+</RSLogix5000Content>

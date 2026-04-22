@@ -1,0 +1,117 @@
+﻿<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="33.04" TargetName="AO_01" TargetType="Module" ContainsContext="true" ExportDate="Wed Apr 22 10:41:00 2026" ExportOptions="References NoRawData L5KData DecoratedData Context Dependencies ForceProtectedEncoding AllProjDocTrans">
+<Controller Use="Context" Name="C">
+<Modules Use="Context">
+<Module Use="Target" Name="AO_01" CatalogNumber="1734-OE4C/C" Vendor="1" ProductType="115" ProductCode="211" Major="3" Minor="1" ParentModule="RACK01" ParentModPortId="1" Inhibited="false"
+ MajorFault="false">
+<EKey State="CompatibleModule"/>
+<Ports>
+<Port Id="1" Address="5" Type="PointIO" Upstream="true"/>
+</Ports>
+<Communications CommMethod="536870913">
+<ConfigTag ConfigSize="76" ExternalAccess="Read/Write">
+<Data Format="L5K">
+<![CDATA[[80,123,1,0,0,1638,8191,-32768,32767,0,1,1,0,0,0,0,0,1638,8191,-32768,32767,0,1,1,0,0,0,0,0,1638,8191,-32768,32767
+		,0,1,1,0,0,0,0,0,1638,8191,-32768,32767,0,1,1,0,0,0]]]>
+</Data>
+<Data Format="Decorated">
+<Structure DataType="AB:1734_OE4:C:0">
+<DataValueMember Name="Ch0FaultValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch0ProgValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch0LowEngineering" DataType="INT" Radix="Decimal" Value="1638"/>
+<DataValueMember Name="Ch0HighEngineering" DataType="INT" Radix="Decimal" Value="8191"/>
+<DataValueMember Name="Ch0LowLimit" DataType="INT" Radix="Decimal" Value="-32768"/>
+<DataValueMember Name="Ch0HighLimit" DataType="INT" Radix="Decimal" Value="32767"/>
+<DataValueMember Name="Ch0RangeType" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch0FaultMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch0ProgMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch0LimitAlarmLatch" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch0AlarmDisable" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch1FaultValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch1ProgValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch1LowEngineering" DataType="INT" Radix="Decimal" Value="1638"/>
+<DataValueMember Name="Ch1HighEngineering" DataType="INT" Radix="Decimal" Value="8191"/>
+<DataValueMember Name="Ch1LowLimit" DataType="INT" Radix="Decimal" Value="-32768"/>
+<DataValueMember Name="Ch1HighLimit" DataType="INT" Radix="Decimal" Value="32767"/>
+<DataValueMember Name="Ch1RangeType" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch1FaultMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch1ProgMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch1LimitAlarmLatch" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch1AlarmDisable" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch2FaultValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch2ProgValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch2LowEngineering" DataType="INT" Radix="Decimal" Value="1638"/>
+<DataValueMember Name="Ch2HighEngineering" DataType="INT" Radix="Decimal" Value="8191"/>
+<DataValueMember Name="Ch2LowLimit" DataType="INT" Radix="Decimal" Value="-32768"/>
+<DataValueMember Name="Ch2HighLimit" DataType="INT" Radix="Decimal" Value="32767"/>
+<DataValueMember Name="Ch2RangeType" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch2FaultMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch2ProgMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch2LimitAlarmLatch" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch2AlarmDisable" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch3FaultValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch3ProgValue" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch3LowEngineering" DataType="INT" Radix="Decimal" Value="1638"/>
+<DataValueMember Name="Ch3HighEngineering" DataType="INT" Radix="Decimal" Value="8191"/>
+<DataValueMember Name="Ch3LowLimit" DataType="INT" Radix="Decimal" Value="-32768"/>
+<DataValueMember Name="Ch3HighLimit" DataType="INT" Radix="Decimal" Value="32767"/>
+<DataValueMember Name="Ch3RangeType" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch3FaultMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch3ProgMode" DataType="SINT" Radix="Decimal" Value="1"/>
+<DataValueMember Name="Ch3LimitAlarmLatch" DataType="SINT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch3AlarmDisable" DataType="SINT" Radix="Decimal" Value="0"/>
+</Structure>
+</Data>
+</ConfigTag>
+<Connections>
+<Connection Name="OutputData" RPI="80000" Type="Output" EventID="0" ProgrammaticallySendEventTrigger="false" Unicast="false">
+<InputTag ExternalAccess="Read/Write">
+<Data Format="Decorated">
+<Structure DataType="AB:1734_OE4:I:0">
+<DataValueMember Name="Fault" DataType="DINT" Radix="Binary" Value="2#0000_0000_0000_0000_0000_0000_0000_0000"/>
+<DataValueMember Name="Ch0Status" DataType="SINT" Radix="Binary" Value="2#0000_0000"/>
+<DataValueMember Name="Ch0Fault" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch0Calibration" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch0LAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch0HAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch1Status" DataType="SINT" Radix="Binary" Value="2#0000_0000"/>
+<DataValueMember Name="Ch1Fault" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch1Calibration" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch1LAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch1HAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch2Status" DataType="SINT" Radix="Binary" Value="2#0000_0000"/>
+<DataValueMember Name="Ch2Fault" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch2Calibration" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch2LAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch2HAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch3Status" DataType="SINT" Radix="Binary" Value="2#0000_0000"/>
+<DataValueMember Name="Ch3Fault" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch3Calibration" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch3LAlarm" DataType="BOOL" Value="0"/>
+<DataValueMember Name="Ch3HAlarm" DataType="BOOL" Value="0"/>
+</Structure>
+</Data>
+</InputTag>
+<OutputTag ExternalAccess="Read/Write">
+<Data Format="L5K">
+<![CDATA[[0,0,0,0]]]>
+</Data>
+<Data Format="Decorated">
+<Structure DataType="AB:1734_OE4:O:0">
+<DataValueMember Name="Ch0Data" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch1Data" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch2Data" DataType="INT" Radix="Decimal" Value="0"/>
+<DataValueMember Name="Ch3Data" DataType="INT" Radix="Decimal" Value="0"/>
+</Structure>
+</Data>
+</OutputTag>
+</Connection>
+</Connections>
+</Communications>
+<ExtendedProperties>
+<public><ConfigID>400</ConfigID><CatNum>1734-OE4C</CatNum></public>
+</ExtendedProperties>
+</Module>
+</Modules>
+</Controller>
+</RSLogix5000Content>
