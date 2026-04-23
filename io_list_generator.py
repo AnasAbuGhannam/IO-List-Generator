@@ -2,6 +2,7 @@
 IO List Generator — Allen-Bradley / Rockwell Automation
 Generates IO lists, EPLAN exports, L5X hardware configs, tag objects, and mirroring code.
 """
+import csv
 import os
 import re
 import random
@@ -42,7 +43,7 @@ IO_COLUMNS = [
 ]
 
 COL_WIDTHS = {
-    1:12.14, 2:20.29, 3:9.29,  4:59.43, 5:23.57, 6:3.43,  7:13.0,  8:13.0,
+    1:16.0,  2:20.29, 3:9.29,  4:59.43, 5:23.57, 6:3.43,  7:13.0,  8:13.0,
     9:11.14, 10:14.0, 11:11.86,12:6.71, 13:6.0,  14:6.0,  15:7.14, 16:11.71,
     17:9.0,  18:8.14, 19:7.57, 20:15.14,21:9.0,  22:5.86, 23:6.43, 24:4.57,
     25:4.86, 26:8.0,  27:3.57, 28:2.14, 29:2.29, 30:3.57, 31:6.43, 32:6.0
@@ -399,6 +400,9 @@ def build_io_list(proj, module_db, hw_config, eq_types, matrix, sig_order, equip
                     len(rack_by_type[t]) for t in TYPE_ORDER[:TYPE_ORDER.index(sig_type)]
                 ) + mod_idx
 
+                # R@@.S##.%%**  @@=rack seq, ##=slot, %%=type, **=module order in type per rack
+                addr = f"R{str(rack_num).zfill(2)}.S{str(slot_num).zfill(2)}.{sig_type}{str(mod_idx + 1).zfill(2)}"
+
                 io_rows.append({
                     "_row_type": "mod_header",
                     "rack_num": rack_num, "rack_name": rack_name,
@@ -407,7 +411,6 @@ def build_io_list(proj, module_db, hw_config, eq_types, matrix, sig_order, equip
                 })
 
                 for ch in range(mod["qty"]):
-                    addr = f"{sig_type}_{str(rack_num).zfill(2)}.{str(slot_num).zfill(2)}"
                     term = f"{sig_type}-{str(slot_num).zfill(3)}/{ch // 8 + 1}"
                     if pending_idx < len(pending):
                         d = pending[pending_idx]
@@ -545,6 +548,22 @@ def build_io_list_revision(proj, module_db, mfg_channels, eq_types, matrix, sig_
         d["_assigned"] = True
         log(f"  Assigned {d['tag']} / {d['sig_desc']} → {ch['sig_type']} slot {ch['slot_num']} ch {ch['ch']}")
 
+    # Compute address lookups for new R@@.S##.%%** format
+    revised_rack_order = list(dict.fromkeys(ch["rack_name"] for ch in revised))
+    rack_seq_map = {name: idx + 1 for idx, name in enumerate(revised_rack_order)}
+
+    slots_by_rack_type = {}
+    for ch in revised:
+        key = (ch["rack_name"], ch["sig_type"])
+        if key not in slots_by_rack_type:
+            slots_by_rack_type[key] = []
+        if ch["slot_num"] not in slots_by_rack_type[key]:
+            slots_by_rack_type[key].append(ch["slot_num"])
+    slot_rank_map = {}
+    for (rack, stype), slots in slots_by_rack_type.items():
+        for rank, slot in enumerate(sorted(slots), 1):
+            slot_rank_map[(rack, stype, slot)] = rank
+
     final_rows = []
     seen_racks = set()
     prev_slot_key = None
@@ -565,9 +584,13 @@ def build_io_list_revision(proj, module_db, mfg_channels, eq_types, matrix, sig_
             })
             prev_slot_key = slot_key
 
+        rack_seq  = rack_seq_map.get(ch["rack_name"], 1)
+        type_rank = slot_rank_map.get((ch["rack_name"], ch["sig_type"], ch["slot_num"]), 1)
+        addr = f"R{rack_seq:02d}.S{ch['slot_num']:02d}.{ch['sig_type']}{type_rank:02d}"
+
         if ch["status"] == "signal":
             final_rows.append({
-                "_row_type": "signal", "controller": ch["io_addr"],
+                "_row_type": "signal", "controller": addr,
                 "tag": ch["tag"], "eq_desc": ch["eq_desc"], "sig_desc": ch["sig_desc"],
                 "system": ch["system"], "rack": ch["rack_num"], "rack_name": ch["rack_name"],
                 "slot": ch["slot_num"], "ch": ch["ch"], "sig_type": ch["sig_type"],
@@ -576,7 +599,7 @@ def build_io_list_revision(proj, module_db, mfg_channels, eq_types, matrix, sig_
             })
         else:
             final_rows.append({
-                "_row_type": "spare", "controller": ch["io_addr"], "sig_type": ch["sig_type"],
+                "_row_type": "spare", "controller": addr, "sig_type": ch["sig_type"],
                 "rack": ch["rack_num"], "rack_name": ch["rack_name"], "slot": ch["slot_num"],
                 "ch": ch["ch"], "wire_color": ch["wire_color"], "term_block": ch["term_block"],
                 "t1": ch["t1"], "t2": ch["t2"], "power": ch["power"],
@@ -816,7 +839,6 @@ def generate_eplan_excel(final_rows, hw_config, module_db, out_path, log_fn=None
     for cell_ref, val in headers.items():
         ws[cell_ref] = val
 
-    # Column widths
     ws.column_dimensions["A"].width = 16
     ws.column_dimensions["B"].width = 22
     ws.column_dimensions["C"].width = 16
@@ -828,49 +850,47 @@ def generate_eplan_excel(final_rows, hw_config, module_db, out_path, log_fn=None
     ws.column_dimensions["I"].width = 50
     ws.column_dimensions["J"].width = 20
 
-    # Build slot→module-info lookup
     _, _, slot_lookup = get_rack_module_assignments(hw_config, module_db)
 
     serial = random.randint(100000, 899999)
     current_row = 3
 
     for r in final_rows:
-        if r["_row_type"] != "signal":
+        rt = r["_row_type"]
+        if rt not in ("signal", "spare"):
             continue
 
-        sig_type = r["sig_type"]
-        rack_num = r["rack"]
-        slot_num = r["slot"]
-        ch       = r["ch"]
+        sig_type  = r["sig_type"]
+        rack_num  = r["rack"]
+        slot_num  = r["slot"]
+        ch        = r["ch"]
         rack_name = r.get("rack_name", "")
 
-        # Module info for subcounter
-        mod_entry = slot_lookup.get((rack_name, slot_num), {})
-        mod_idx   = mod_entry.get("mod_idx", 0)
+        mod_entry  = slot_lookup.get((rack_name, slot_num), {})
+        mod_idx    = mod_entry.get("mod_idx", 0)
         subcounter = f"{sig_type}{str(mod_idx).zfill(2)}" if mod_idx else ""
 
-        # DT: Counter  ← rack##.S##
         dt_counter = f"{str(rack_num).zfill(2)}.S{str(slot_num).zfill(2)}"
 
-        # Plug designation
-        if sig_type in ("DI", "AI"):
-            plug = f"IN {ch}"
-        else:
-            plug = f"OUT {ch}"
+        plug = f"IN {ch}" if sig_type in ("DI", "AI") else f"OUT {ch}"
 
-        # Function text
-        func_text = f"{r['eq_desc']} – {r['sig_desc']}"
+        if rt == "signal":
+            func_text = f"{r['eq_desc']} – {r['sig_desc']}"
+            tag_val   = r["tag"]
+        else:  # spare
+            func_text = "SPARE"
+            tag_val   = "SPARE"
 
-        ws.cell(current_row, 1).value = f"17/{serial:06d}"
-        ws.cell(current_row, 2).value = "2"
-        ws.cell(current_row, 3).value = "1"
-        ws.cell(current_row, 4).value = "300"
-        ws.cell(current_row, 5).value = "R"
-        ws.cell(current_row, 6).value = dt_counter
-        ws.cell(current_row, 7).value = subcounter
-        ws.cell(current_row, 8).value = plug
-        ws.cell(current_row, 9).value = func_text
-        ws.cell(current_row, 10).value = r["tag"]
+        ws.cell(current_row, 1).value  = f"17/{serial:06d}"
+        ws.cell(current_row, 2).value  = "2"
+        ws.cell(current_row, 3).value  = "1"
+        ws.cell(current_row, 4).value  = "300"
+        ws.cell(current_row, 5).value  = "R"
+        ws.cell(current_row, 6).value  = dt_counter
+        ws.cell(current_row, 7).value  = subcounter
+        ws.cell(current_row, 8).value  = plug
+        ws.cell(current_row, 9).value  = func_text
+        ws.cell(current_row, 10).value = tag_val
 
         serial += 1
         current_row += 1
@@ -886,7 +906,6 @@ def generate_l5x_files(hw_config, module_db, template_dir, output_dir, sw_revisi
     def log(msg):
         if log_fn: log_fn(msg)
 
-    # Check for missing templates upfront
     required = set(row["model"] for row in hw_config)
     missing  = [m for m in required if not os.path.exists(os.path.join(template_dir, f"{m}.L5X"))]
     if missing:
@@ -916,27 +935,17 @@ def generate_l5x_files(hw_config, module_db, template_dir, output_dir, sw_revisi
             with open(tpl_path, "r", encoding="utf-8-sig") as f:
                 content = f.read()
 
-            # Replace SoftwareRevision (appears once in root element)
             content = re.sub(r'SoftwareRevision="[^"]*"',
                              f'SoftwareRevision="{sw_revision}"', content)
-
-            # Replace TargetName in RSLogix5000Content root element
             content = re.sub(r'TargetName="[^"]*"',
                              f'TargetName="{mod_name}"', content)
-
-            # Replace Name in Module Use="Target" opening tag
             content = re.sub(r'(<Module\s+Use="Target"\s+)Name="[^"]*"',
                              f'\\1Name="{mod_name}"', content)
-
-            # Replace ParentModule
             content = re.sub(r'ParentModule="[^"]*"',
                              f'ParentModule="{rack_name}"', content)
-
-            # Replace Address in Port element (slot number)
             content = re.sub(r'(<Port\s[^>]*)Address="[^"]*"',
                              f'\\1Address="{slot_num}"', content)
 
-            # Extract the Module block
             m = re.search(r'<Module\s+Use="Target".*?</Module>', content, re.DOTALL)
             if m:
                 module_blocks.append(m.group(0))
@@ -969,65 +978,63 @@ def generate_l5x_files(hw_config, module_db, template_dir, output_dir, sw_revisi
 
 
 # ──────────────────────────────────────────────────────────────
-# TAG OBJECTS EXCEL GENERATOR
+# TAG OBJECTS CSV GENERATOR
 # ──────────────────────────────────────────────────────────────
-def generate_tag_objects(equipment, tag_prefix, out_path, log_fn=None):
+def generate_tag_objects(equipment, out_path, log_fn=None):
     def log(msg):
         if log_fn: log_fn(msg)
 
     BOOL_TYPES = {"DI", "DO"}
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Tags"
+    now_str = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
 
-    headers = ["Name", "Usage", "Alias For", "Data Type", "Description", "External Access", "Constant"]
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(1, col)
-        c.value = h
-        c.font = Font(name="Arial", size=10, bold=True)
-        c.fill = _fill(C_NAVY)
-        c.border = _border()
-        c.alignment = _align()
+    rows_written = 0
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        # RSLogix 5000 CSV header block
+        f.write('remark,"CSV-Import-Export"\n')
+        f.write(f'remark,"Date = {now_str}"\n')
+        f.write('remark,"Version = RSLogix 5000 v33.04"\n')
+        f.write('remark,"Owner = "\n')
+        f.write('remark,"Company = "\n')
+        f.write('0.3\n')
+        f.write('TYPE,SCOPE,NAME,DESCRIPTION,DATATYPE,SPECIFIER,ATTRIBUTES\n')
 
-    ws.column_dimensions["A"].width = 25
-    ws.column_dimensions["D"].width = 18
-    ws.column_dimensions["E"].width = 50
-    ws.column_dimensions["F"].width = 16
-    ws.row_dimensions[1].height = 20
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+        for eq in equipment:
+            tag_name = eq["tag"].strip()
+            if not tag_name or tag_name.upper() == "SPARE":
+                continue
 
-    current_row = 2
-    for eq in equipment:
-        tag_name = eq["tag"].replace("-", "_").replace(" ", "_")
-        if tag_name and tag_name[0].isdigit():
-            tag_name = tag_prefix + tag_name
+            eq_type   = eq["type"]
+            data_type = "BOOL" if eq_type in BOOL_TYPES else eq_type
+            desc      = eq.get("desc", "").strip()
 
-        eq_type   = eq["type"]
-        data_type = "BOOL" if eq_type in BOOL_TYPES else eq_type
+            if data_type == "BOOL":
+                attrs = "(RADIX := Decimal, Constant := false, ExternalAccess := Read/Write)"
+            else:
+                attrs = "(Constant := false, ExternalAccess := Read/Write)"
 
-        row_vals = [tag_name, "Local", 0, data_type, eq["desc"], "Read/Write", 0]
-        for col, val in enumerate(row_vals, 1):
-            c = ws.cell(current_row, col)
-            c.value = val
-            c.font = Font(name="Arial", size=10)
-            c.border = _border()
-            c.alignment = Alignment(horizontal="left" if col in (1,4,5) else "center",
-                                    vertical="center")
-        ws.row_dimensions[current_row].height = 16
-        current_row += 1
+            writer.writerow(["TAG", "", tag_name, desc, data_type, "", attrs])
+            rows_written += 1
 
-    wb.save(out_path)
-    log(f"✓ Tag objects saved: {out_path} ({current_row - 2} tags)")
+    log(f"✓ Tag objects saved: {out_path} ({rows_written} tags)")
 
 
 # ──────────────────────────────────────────────────────────────
 # MIRRORING CODE GENERATOR
 # ──────────────────────────────────────────────────────────────
-def generate_mirroring_files(final_rows, plc_attributes, local_racks, code_type, output_dir, log_fn=None):
+def generate_mirroring_files(final_rows, plc_attributes, local_rack, code_type, output_dir, log_fn=None):
     def log(msg):
         if log_fn: log_fn(msg)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    TYPE_LABELS = {
+        "DI": "Digital Inputs",
+        "DO": "Digital Outputs",
+        "AI": "Analog Inputs",
+        "AO": "Analog Outputs",
+    }
 
     # Group signals by rack
     signals_by_rack = {}
@@ -1045,8 +1052,10 @@ def generate_mirroring_files(final_rows, plc_attributes, local_racks, code_type,
 
     file_count = 0
     for rack_name, signals in signals_by_rack.items():
-        adapter = "LOCAL" if rack_name in local_racks else rack_name.replace(" ", "")
-        lines   = []
+        adapter = "LOCAL" if rack_name == local_rack else rack_name.replace(" ", "")
+
+        # Collect statements grouped by signal type
+        stmts_by_type = {t: [] for t in TYPE_ORDER}
 
         for sig in signals:
             sig_desc = sig["sig_desc"]
@@ -1058,13 +1067,12 @@ def generate_mirroring_files(final_rows, plc_attributes, local_racks, code_type,
             if inverted:
                 plc_attr = plc_attr[1:]
 
-            tag_name = sig["tag"].replace("-", "_").replace(" ", "_")
+            tag_name = sig["tag"]           # taken as-is from input template
             tag_ref  = f"{tag_name}.{plc_attr}"
             sig_type = sig["sig_type"]
             slot     = sig["slot"]
             ch       = sig["ch"]
 
-            # Physical address
             if sig_type == "DI":
                 phys = f"{adapter}:{slot}:I.Data.{ch}"
             elif sig_type == "DO":
@@ -1078,25 +1086,47 @@ def generate_mirroring_files(final_rows, plc_attributes, local_racks, code_type,
 
             if code_type == "ST":
                 if is_input:
-                    stmt = f"{tag_ref} := {'NOT ' if inverted else ''}{phys};"
+                    stmt = f"    {tag_ref} := {'NOT ' if inverted else ''}{phys};"
                 else:
-                    stmt = f"{phys} := {'NOT ' if inverted else ''}{tag_ref};"
-                lines.append(stmt)
-            else:  # Ladder Logic text
+                    stmt = f"    {phys} := {'NOT ' if inverted else ''}{tag_ref};"
+            else:  # Ladder Logic
                 if sig_type == "DI":
                     contact = "XIO" if inverted else "XIC"
-                    lines.append(f"{contact}({phys})OTE({tag_ref});")
+                    stmt = f"{contact}({phys})OTE({tag_ref});"
                 elif sig_type == "DO":
                     contact = "XIO" if inverted else "XIC"
-                    lines.append(f"{contact}({tag_ref})OTE({phys});")
+                    stmt = f"{contact}({tag_ref})OTE({phys});"
                 elif sig_type == "AI":
                     src = f"NOT {phys}" if inverted else phys
-                    lines.append(f"COP({src},{tag_ref},1);")
+                    stmt = f"COP({src},{tag_ref},1);"
                 else:  # AO
                     src = f"NOT {tag_ref}" if inverted else tag_ref
-                    lines.append(f"COP({src},{phys},1);")
+                    stmt = f"COP({src},{phys},1);"
 
-        if not lines:
+            stmts_by_type[sig_type].append(stmt)
+
+        # Build output with regions (ST) or comments (LL) per type
+        output_lines = []
+        for sig_type in TYPE_ORDER:
+            type_stmts = stmts_by_type[sig_type]
+            if not type_stmts:
+                continue
+            label = TYPE_LABELS[sig_type]
+            if code_type == "ST":
+                output_lines.append(f"{{ region {label} }}")
+                output_lines.extend(type_stmts)
+                output_lines.append("{ end_region }")
+                output_lines.append("")
+            else:
+                output_lines.append(f"(* === {label} === *)")
+                output_lines.extend(type_stmts)
+                output_lines.append("")
+
+        # Remove trailing blank line
+        while output_lines and output_lines[-1] == "":
+            output_lines.pop()
+
+        if not output_lines:
             log(f"⚠  No mapped signals for rack {rack_name} — file skipped.")
             continue
 
@@ -1104,8 +1134,8 @@ def generate_mirroring_files(final_rows, plc_attributes, local_racks, code_type,
         ext       = "st" if code_type == "ST" else "txt"
         out_path  = os.path.join(output_dir, f"{safe_name}_Mirror.{ext}")
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        log(f"✓ Mirror saved: {os.path.basename(out_path)} ({len(lines)} statements)")
+            f.write("\n".join(output_lines))
+        log(f"✓ Mirror saved: {os.path.basename(out_path)} ({sum(len(v) for v in stmts_by_type.values())} statements)")
         file_count += 1
 
     if file_count == 0:
@@ -1126,20 +1156,24 @@ class App(tk.Tk):
         self.rev_file_path = None
         self.eplan_out_path = None
         self.tags_out_path  = None
-        self.rack_local_vars = {}
-        self._racks_chk_frame = None
-        # store final_rows between IO list generation and other generators
+        self.rack_local_var = tk.StringVar(value="NONE")
+        self._racks_radio_frame = None
         self._last_final_rows = None
         self._last_hw_config  = None
         self._last_module_db  = None
         self._last_equipment  = None
         self._last_plc_attrs  = None
+        # Open-location buttons (enabled after generation)
+        self.btn_open_eplan  = None
+        self.btn_open_l5x    = None
+        self.btn_open_tags   = None
+        self.btn_open_mirror = None
         self._build_ui()
         self._center()
 
     def _center(self):
         self.update_idletasks()
-        w, h = 920, 760
+        w, h = 920, 780
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -1220,36 +1254,20 @@ class App(tk.Tk):
         dnb = ttk.Notebook(parent)
         dnb.pack(fill="both", expand=True, padx=6, pady=6)
 
+        # IO List sub-tab
+        ilf = tk.Frame(dnb, bg=BG, padx=14, pady=10)
+        dnb.add(ilf, text="  IO List  ")
+        self._build_iolist_sub(ilf, FH, FB, FSM, BG, BN, FN)
+
+        # EPLAN Export sub-tab
         ef = tk.Frame(dnb, bg=BG, padx=14, pady=10)
         dnb.add(ef, text="  EPLAN Export  ")
-
-        self._sec(ef, "EPLAN Import-Ready Excel", FH)
-        tk.Label(ef, text="Generates one row per IO signal, ready for EPLAN import.",
-                 font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
-
-        er = tk.Frame(ef, bg=BG)
-        er.pack(fill="x", pady=(0,8))
-        tk.Label(er, text="Output file:", font=FB, bg=BG).pack(side="left")
-        self.lbl_eplan = tk.Label(er, text="Not set", font=FSM,
-                                  bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
-        self.lbl_eplan.pack(side="left", fill="x", expand=True, padx=(6,0))
-        tk.Button(er, text="Browse…", font=FB, bg=BN, fg=FN, relief="flat",
-                  padx=14, pady=4, cursor="hand2",
-                  command=self._browse_eplan_out).pack(side="left", padx=(6,0))
-
-        tk.Button(ef, text="▶  Generate EPLAN File", font=("Arial",11,"bold"),
-                  bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
-                  command=self._run_eplan).pack(anchor="w", pady=(8,0))
+        self._build_eplan_sub(ef, FH, FB, FSM, BG, BN, FN)
 
     # ── Automation Team tab ──────────────────────────────────
     def _build_auto_tab(self, parent, FH, FB, FSM, BG, BN, FN):
         anb = ttk.Notebook(parent)
         anb.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # IO List sub-tab
-        ilf = tk.Frame(anb, bg=BG, padx=14, pady=10)
-        anb.add(ilf, text="  IO List  ")
-        self._build_iolist_sub(ilf, FH, FB, FSM, BG, BN, FN)
 
         # L5X sub-tab
         lf = tk.Frame(anb, bg=BG, padx=14, pady=10)
@@ -1306,6 +1324,32 @@ class App(tk.Tk):
                                   command=self._open_out_folder, state="disabled")
         self.btn_open.pack(side="left", padx=(10,0))
 
+    def _build_eplan_sub(self, p, FH, FB, FSM, BG, BN, FN):
+        self._sec(p, "EPLAN Import-Ready Excel", FH)
+        tk.Label(p, text="Generates one row per IO signal (and SPARE channels), ready for EPLAN import.",
+                 font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
+
+        er = tk.Frame(p, bg=BG)
+        er.pack(fill="x", pady=(0,8))
+        tk.Label(er, text="Output file:", font=FB, bg=BG).pack(side="left")
+        self.lbl_eplan = tk.Label(er, text="Not set", font=FSM,
+                                  bg="#e8eef4", fg="#444", relief="flat", anchor="w", padx=8, pady=5)
+        self.lbl_eplan.pack(side="left", fill="x", expand=True, padx=(6,0))
+        tk.Button(er, text="Browse…", font=FB, bg=BN, fg=FN, relief="flat",
+                  padx=14, pady=4, cursor="hand2",
+                  command=self._browse_eplan_out).pack(side="left", padx=(6,0))
+
+        bf = tk.Frame(p, bg=BG)
+        bf.pack(fill="x", pady=(8,0))
+        tk.Button(bf, text="▶  Generate EPLAN File", font=("Arial",11,"bold"),
+                  bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
+                  command=self._run_eplan).pack(side="left")
+        self.btn_open_eplan = tk.Button(bf, text="Open file location", font=FB, bg=BN, fg=FN,
+                                        relief="flat", padx=14, pady=8, cursor="hand2",
+                                        command=lambda: self._open_location(self.eplan_out_path),
+                                        state="disabled")
+        self.btn_open_eplan.pack(side="left", padx=(10,0))
+
     def _build_l5x_sub(self, p, FH, FB, FSM, BG, BN, FN):
         self._sec(p, "Studio 5000 Hardware Configuration", FH)
         tk.Label(p, text="Generates one L5X file per rack for import into Studio 5000 Logix Designer.",
@@ -1331,22 +1375,21 @@ class App(tk.Tk):
         tk.Button(of, text="Change…", font=FB, bg=BN, fg=FN, relief="flat",
                   padx=14, pady=4, cursor="hand2", command=self._browse_l5x_out).pack(side="left", padx=(6,0))
 
-        tk.Button(p, text="▶  Generate L5X Files", font=("Arial",11,"bold"),
+        bf = tk.Frame(p, bg=BG)
+        bf.pack(fill="x", pady=(8,0))
+        tk.Button(bf, text="▶  Generate L5X Files", font=("Arial",11,"bold"),
                   bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
-                  command=self._run_l5x).pack(anchor="w", pady=(8,0))
+                  command=self._run_l5x).pack(side="left")
+        self.btn_open_l5x = tk.Button(bf, text="Open output folder", font=FB, bg=BN, fg=FN,
+                                      relief="flat", padx=14, pady=8, cursor="hand2",
+                                      command=lambda: self._open_location(self.l5x_out_dir, is_folder=True),
+                                      state="disabled")
+        self.btn_open_l5x.pack(side="left", padx=(10,0))
 
     def _build_tags_sub(self, p, FH, FB, FSM, BG, BN, FN):
         self._sec(p, "Studio 5000 Tag Objects", FH)
-        tk.Label(p, text="Generates an Excel file with equipment tag definitions for Studio 5000 import.",
+        tk.Label(p, text="Generates a CSV file with equipment tag definitions for Studio 5000 import.",
                  font=FSM, bg=BG, fg="#555").pack(anchor="w", pady=(0,8))
-
-        pr = tk.Frame(p, bg=BG)
-        pr.pack(fill="x", pady=(0,8))
-        tk.Label(pr, text="Prefix for tags starting with a number:", font=FB, bg=BG).pack(side="left")
-        self.tag_prefix_var = tk.StringVar(value="")
-        tk.Entry(pr, textvariable=self.tag_prefix_var, font=FB, width=8,
-                 relief="flat", bg="#e8eef4").pack(side="left", padx=(8,0), ipady=3)
-        tk.Label(pr, text="(leave blank if not needed)", font=FSM, bg=BG, fg="#888").pack(side="left", padx=(6,0))
 
         self._sec(p, "Output File", FH)
         of = tk.Frame(p, bg=BG)
@@ -1357,9 +1400,16 @@ class App(tk.Tk):
         tk.Button(of, text="Browse…", font=FB, bg=BN, fg=FN, relief="flat",
                   padx=14, pady=4, cursor="hand2", command=self._browse_tags_out).pack(side="left", padx=(6,0))
 
-        tk.Button(p, text="▶  Generate Tag Objects", font=("Arial",11,"bold"),
+        bf = tk.Frame(p, bg=BG)
+        bf.pack(fill="x", pady=(8,0))
+        tk.Button(bf, text="▶  Generate Tag Objects", font=("Arial",11,"bold"),
                   bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
-                  command=self._run_tags).pack(anchor="w", pady=(8,0))
+                  command=self._run_tags).pack(side="left")
+        self.btn_open_tags = tk.Button(bf, text="Open file location", font=FB, bg=BN, fg=FN,
+                                       relief="flat", padx=14, pady=8, cursor="hand2",
+                                       command=lambda: self._open_location(self.tags_out_path),
+                                       state="disabled")
+        self.btn_open_tags.pack(side="left", padx=(10,0))
 
     def _build_mirror_sub(self, p, FH, FB, FSM, BG, BN, FN):
         self._sec(p, "PLC Mirroring Code", FH)
@@ -1371,20 +1421,20 @@ class App(tk.Tk):
         cr.pack(fill="x", pady=(0,8))
         tk.Label(cr, text="Code type:", font=FB, bg=BG).pack(side="left")
         self.mirror_code_type = tk.StringVar(value="ST")
-        tk.Radiobutton(cr, text="Structured Text (IEC 61131-3 ST)", variable=self.mirror_code_type,
+        tk.Radiobutton(cr, text="Structured Text", variable=self.mirror_code_type,
                        value="ST", font=FB, bg=BG, activebackground=BG).pack(side="left", padx=(8,0))
         tk.Radiobutton(cr, text="Ladder Logic", variable=self.mirror_code_type,
                        value="LL", font=FB, bg=BG, activebackground=BG).pack(side="left", padx=(8,0))
 
-        # LOCAL racks
-        self._sec(p, "LOCAL Racks", FH)
-        tk.Label(p, text="Check racks that are in the same chassis as the controller (LOCAL):",
+        # LOCAL rack (radio — only one)
+        self._sec(p, "LOCAL Rack", FH)
+        tk.Label(p, text="Select the rack that is in the same chassis as the controller (LOCAL):",
                  font=FSM, bg=BG, fg="#555").pack(anchor="w")
         rack_outer = tk.Frame(p, bg=BG)
         rack_outer.pack(fill="x", pady=(4,8))
-        self._racks_chk_frame = tk.Frame(rack_outer, bg="#e8eef4", relief="flat", padx=8, pady=6)
-        self._racks_chk_frame.pack(side="left")
-        tk.Label(self._racks_chk_frame, text="Browse an input file to see racks",
+        self._racks_radio_frame = tk.Frame(rack_outer, bg="#e8eef4", relief="flat", padx=8, pady=6)
+        self._racks_radio_frame.pack(side="left")
+        tk.Label(self._racks_radio_frame, text="Browse an input file to see racks",
                  font=FSM, bg="#e8eef4", fg="#888").pack()
 
         # Output folder
@@ -1398,9 +1448,16 @@ class App(tk.Tk):
         tk.Button(of, text="Change…", font=FB, bg=BN, fg=FN, relief="flat",
                   padx=14, pady=4, cursor="hand2", command=self._browse_mirror_out).pack(side="left", padx=(6,0))
 
-        tk.Button(p, text="▶  Generate Mirroring Files", font=("Arial",11,"bold"),
+        bf = tk.Frame(p, bg=BG)
+        bf.pack(fill="x", pady=(8,0))
+        tk.Button(bf, text="▶  Generate Mirroring Files", font=("Arial",11,"bold"),
                   bg="#1E7C3A", fg="white", relief="flat", padx=22, pady=8, cursor="hand2",
-                  command=self._run_mirroring).pack(anchor="w", pady=(8,0))
+                  command=self._run_mirroring).pack(side="left")
+        self.btn_open_mirror = tk.Button(bf, text="Open output folder", font=FB, bg=BN, fg=FN,
+                                         relief="flat", padx=14, pady=8, cursor="hand2",
+                                         command=lambda: self._open_location(self.mirror_out_dir, is_folder=True),
+                                         state="disabled")
+        self.btn_open_mirror.pack(side="left", padx=(10,0))
 
     # ── Helpers ─────────────────────────────────────────────
     def _toggle_revision(self):
@@ -1424,21 +1481,23 @@ class App(tk.Tk):
         self.status_var.set(msg)
 
     def _update_rack_checkboxes(self):
-        if not self.input_path or not self._racks_chk_frame:
+        if not self.input_path or not self._racks_radio_frame:
             return
         racks = _quick_read_racks(self.input_path)
-        for w in self._racks_chk_frame.winfo_children():
+        for w in self._racks_radio_frame.winfo_children():
             w.destroy()
-        self.rack_local_vars = {}
+        self.rack_local_var.set("NONE")
         if not racks:
-            tk.Label(self._racks_chk_frame, text="No racks found",
+            tk.Label(self._racks_radio_frame, text="No racks found",
                      font=("Arial",9), bg="#e8eef4", fg="#888").pack()
             return
+        # "None" option
+        tk.Radiobutton(self._racks_radio_frame, text="None", variable=self.rack_local_var,
+                       value="NONE", font=("Arial",10), bg="#e8eef4",
+                       activebackground="#e8eef4").pack(anchor="w")
         for rack in racks:
-            var = tk.BooleanVar(value=False)
-            self.rack_local_vars[rack] = var
-            tk.Checkbutton(self._racks_chk_frame, text=rack, variable=var,
-                           font=("Arial",10), bg="#e8eef4",
+            tk.Radiobutton(self._racks_radio_frame, text=rack, variable=self.rack_local_var,
+                           value=rack, font=("Arial",10), bg="#e8eef4",
                            activebackground="#e8eef4").pack(anchor="w")
 
     # ── Browse handlers ──────────────────────────────────────
@@ -1482,9 +1541,9 @@ class App(tk.Tk):
 
     def _browse_tags_out(self):
         path = filedialog.asksaveasfilename(
-            title="Save Tag Objects File As", defaultextension=".xlsx",
-            initialfile="Tag_Objects.xlsx",
-            filetypes=[("Excel files","*.xlsx")])
+            title="Save Tag Objects File As", defaultextension=".csv",
+            initialfile="Tag_Objects.csv",
+            filetypes=[("CSV files","*.csv"),("All files","*.*")])
         if path:
             self.tags_out_path = path
             self.lbl_tags.configure(text=f"  {os.path.basename(path)}  ({path})")
@@ -1495,17 +1554,26 @@ class App(tk.Tk):
             self.mirror_out_dir = d
             self.lbl_mirror_out.configure(text=d)
 
-    def _open_out_folder(self):
+    def _open_location(self, path, is_folder=False):
         import subprocess, platform
+        if not path:
+            return
         try:
+            target = path if is_folder else os.path.dirname(path)
             if platform.system() == "Windows":
-                os.startfile(self.out_dir)
+                if not is_folder and os.path.isfile(path):
+                    subprocess.Popen(f'explorer /select,"{path}"')
+                else:
+                    os.startfile(target)
             elif platform.system() == "Darwin":
-                subprocess.Popen(["open", self.out_dir])
+                subprocess.Popen(["open", target])
             else:
-                subprocess.Popen(["xdg-open", self.out_dir])
+                subprocess.Popen(["xdg-open", target])
         except:
             pass
+
+    def _open_out_folder(self):
+        self._open_location(self.out_dir, is_folder=True)
 
     def _create_template(self):
         from create_template import main as make_tpl
@@ -1567,7 +1635,6 @@ class App(tk.Tk):
                     final_rows, counts, warnings = build_io_list(
                         proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, self._log)
 
-                # Store for other generators
                 self._last_final_rows = final_rows
                 self._last_hw_config  = hw_config
                 self._last_module_db  = module_db
@@ -1618,7 +1685,7 @@ class App(tk.Tk):
                 final_rows, _, _ = build_io_list(
                     proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, self._log)
                 generate_eplan_excel(final_rows, hw_config, module_db, self.eplan_out_path, self._log)
-                self.after(0, lambda: self._on_done_simple("EPLAN", self.eplan_out_path))
+                self.after(0, lambda: self._on_done_simple("EPLAN", self.eplan_out_path, self.btn_open_eplan))
             except Exception as e:
                 import traceback
                 self._log(f"✗ ERROR: {e}")
@@ -1641,7 +1708,7 @@ class App(tk.Tk):
                 _, module_db, hw_config, _, _, _, _, _ = read_workbook(self.input_path)
                 generate_l5x_files(hw_config, module_db, tpl_dir,
                                    self.l5x_out_dir, self.l5x_sw_rev.get(), self._log)
-                self.after(0, lambda: self._on_done_folder("L5X", self.l5x_out_dir))
+                self.after(0, lambda: self._on_done_folder("L5X", self.l5x_out_dir, self.btn_open_l5x))
             except Exception as e:
                 import traceback
                 self._log(f"✗ ERROR: {e}")
@@ -1657,7 +1724,6 @@ class App(tk.Tk):
         if not self.tags_out_path:
             messagebox.showwarning("No output file", "Please select an output file path first.")
             return
-        tag_prefix = self.tag_prefix_var.get().strip()
         self._start_task()
         self._set_status("Generating tag objects…")
 
@@ -1665,8 +1731,8 @@ class App(tk.Tk):
             try:
                 self._log(f"Reading: {os.path.basename(self.input_path)}")
                 _, _, _, _, _, _, equipment, _ = read_workbook(self.input_path)
-                generate_tag_objects(equipment, tag_prefix, self.tags_out_path, self._log)
-                self.after(0, lambda: self._on_done_simple("Tag Objects", self.tags_out_path))
+                generate_tag_objects(equipment, self.tags_out_path, self._log)
+                self.after(0, lambda: self._on_done_simple("Tag Objects", self.tags_out_path, self.btn_open_tags))
             except Exception as e:
                 import traceback
                 self._log(f"✗ ERROR: {e}")
@@ -1679,8 +1745,10 @@ class App(tk.Tk):
     def _run_mirroring(self):
         if not self._require_input():
             return
-        local_racks = {r for r, v in self.rack_local_vars.items() if v.get()}
-        code_type   = self.mirror_code_type.get()
+        local_rack = self.rack_local_var.get()
+        if local_rack == "NONE":
+            local_rack = ""
+        code_type  = self.mirror_code_type.get()
         self._start_task()
         self._set_status("Generating mirroring files…")
 
@@ -1691,9 +1759,9 @@ class App(tk.Tk):
                     read_workbook(self.input_path)
                 final_rows, _, _ = build_io_list(
                     proj, module_db, hw_config, eq_types, matrix, sig_order, equipment, self._log)
-                generate_mirroring_files(final_rows, plc_attrs, local_racks,
+                generate_mirroring_files(final_rows, plc_attrs, local_rack,
                                          code_type, self.mirror_out_dir, self._log)
-                self.after(0, lambda: self._on_done_folder("Mirroring", self.mirror_out_dir))
+                self.after(0, lambda: self._on_done_folder("Mirroring", self.mirror_out_dir, self.btn_open_mirror))
             except Exception as e:
                 import traceback
                 self._log(f"✗ ERROR: {e}")
@@ -1703,12 +1771,16 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     # ── Done/Error callbacks ─────────────────────────────────
-    def _on_done_simple(self, label, path):
+    def _on_done_simple(self, label, path, open_btn=None):
         self._stop_task(f"{label} done — {os.path.basename(path)}")
+        if open_btn:
+            open_btn.configure(state="normal")
         messagebox.showinfo("Success", f"{label} file generated!\n\nFile: {path}")
 
-    def _on_done_folder(self, label, folder):
+    def _on_done_folder(self, label, folder, open_btn=None):
         self._stop_task(f"{label} done — {folder}")
+        if open_btn:
+            open_btn.configure(state="normal")
         messagebox.showinfo("Success", f"{label} files generated!\n\nFolder: {folder}")
 
     def _on_error(self, msg):
