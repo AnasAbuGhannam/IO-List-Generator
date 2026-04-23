@@ -1149,7 +1149,7 @@ def generate_mirroring_files(final_rows, plc_attributes, local_rack, code_type, 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("IO List Generator — Allen-Bradley / Rockwell")
+        self.title("Engineering Automation Suite — Allen-Bradley / Rockwell")
         self.resizable(True, True)
         self.minsize(820, 700)
         self.input_path    = None
@@ -1192,7 +1192,7 @@ class App(tk.Tk):
         tf = tk.Frame(self, bg=BN, height=52)
         tf.pack(fill="x")
         tf.pack_propagate(False)
-        tk.Label(tf, text="  IO List Generator", font=("Arial",14,"bold"),
+        tk.Label(tf, text="  Engineering Automation Suite", font=("Arial",14,"bold"),
                  bg=BN, fg=FN, anchor="w").pack(side="left", padx=10, pady=10)
         tk.Label(tf, text="Allen-Bradley / Rockwell Automation",
                  font=("Arial",9), bg=BN, fg="#444").pack(side="left", padx=2)
