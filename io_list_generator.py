@@ -1000,11 +1000,42 @@ def generate_tag_objects(equipment, out_path, log_fn=None):
 
     BOOL_TYPES = {"DI", "DO"}
 
+    # Validate and normalise tag names before writing anything
+    validated = []
+    for eq in equipment:
+        raw = eq["tag"].strip()
+        if not raw or raw.upper() == "SPARE":
+            continue
+
+        # Replace hyphens with underscores (allowed auto-fix)
+        tag_name = raw.replace("-", "_")
+
+        # Check for leading digit
+        if tag_name and tag_name[0].isdigit():
+            raise ValueError(
+                f"Invalid tag name: \"{raw}\"\n\n"
+                f"Tag starts with a number, which is not allowed in Studio 5000.\n"
+                f"Equipment description: {eq.get('desc','')}\n\n"
+                f"Please fix this tag in the EQUIPMENT_LIST sheet and regenerate."
+            )
+
+        # Check for remaining invalid characters (anything not a-z, A-Z, 0-9, _)
+        bad_chars = sorted({c for c in tag_name if not (c.isalnum() or c == "_")})
+        if bad_chars:
+            raise ValueError(
+                f"Invalid tag name: \"{raw}\"\n\n"
+                f"Contains unsupported character(s): {' '.join(repr(c) for c in bad_chars)}\n"
+                f"Equipment description: {eq.get('desc','')}\n\n"
+                f"Only letters, digits, and underscores are allowed.\n"
+                f"Please fix this tag in the EQUIPMENT_LIST sheet and regenerate."
+            )
+
+        validated.append((tag_name, eq))
+
     now_str = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
 
     rows_written = 0
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        # RSLogix 5000 CSV header block
         f.write('remark,"CSV-Import-Export"\n')
         f.write(f'remark,"Date = {now_str}"\n')
         f.write('remark,"Version = RSLogix 5000 v33.04"\n')
@@ -1014,11 +1045,7 @@ def generate_tag_objects(equipment, out_path, log_fn=None):
         f.write('TYPE,SCOPE,NAME,DESCRIPTION,DATATYPE,SPECIFIER,ATTRIBUTES\n')
 
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        for eq in equipment:
-            tag_name = eq["tag"].strip()
-            if not tag_name or tag_name.upper() == "SPARE":
-                continue
-
+        for tag_name, eq in validated:
             eq_type   = eq["type"]
             data_type = "BOOL" if eq_type in BOOL_TYPES else eq_type
             desc      = eq.get("desc", "").strip()
@@ -1449,7 +1476,7 @@ class App(tk.Tk):
                   command=self._run_l5x).pack(side="left")
         self.btn_open_l5x = tk.Button(bf, text="Open output folder", font=FB, bg=BN, fg=FN,
                                       relief="flat", padx=14, pady=8, cursor="hand2",
-                                      command=lambda: self._open_location(self.l5x_out_dir, is_folder=True),
+                                      command=lambda: self._open_location(self.l5x_out_dir),
                                       state="disabled")
         self.btn_open_l5x.pack(side="left", padx=(10,0))
 
@@ -1522,7 +1549,7 @@ class App(tk.Tk):
                   command=self._run_mirroring).pack(side="left")
         self.btn_open_mirror = tk.Button(bf, text="Open output folder", font=FB, bg=BN, fg=FN,
                                          relief="flat", padx=14, pady=8, cursor="hand2",
-                                         command=lambda: self._open_location(self.mirror_out_dir, is_folder=True),
+                                         command=lambda: self._open_location(self.mirror_out_dir),
                                          state="disabled")
         self.btn_open_mirror.pack(side="left", padx=(10,0))
 
@@ -1621,26 +1648,28 @@ class App(tk.Tk):
             self.mirror_out_dir = d
             self.lbl_mirror_out.configure(text=d)
 
-    def _open_location(self, path, is_folder=False):
+    def _open_location(self, path):
         import subprocess, platform
         if not path:
             return
         try:
-            target = path if is_folder else os.path.dirname(path)
             if platform.system() == "Windows":
-                if not is_folder and os.path.isfile(path):
-                    subprocess.Popen(f'explorer /select,"{path}"')
+                if os.path.isdir(path):
+                    os.startfile(path)
                 else:
-                    os.startfile(target)
+                    # Open parent folder and highlight the file
+                    subprocess.Popen(f'explorer /select,"{path}"')
             elif platform.system() == "Darwin":
+                target = path if os.path.isdir(path) else os.path.dirname(path)
                 subprocess.Popen(["open", target])
             else:
+                target = path if os.path.isdir(path) else os.path.dirname(path)
                 subprocess.Popen(["xdg-open", target])
         except:
             pass
 
     def _open_out_folder(self):
-        self._open_location(self.out_dir, is_folder=True)
+        self._open_location(self.out_dir)
 
     def _create_template(self):
         from create_template import main as make_tpl
