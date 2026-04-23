@@ -1,7 +1,21 @@
 """
-IO List Generator — Allen-Bradley / Rockwell Automation
+Engineering Automation Suite — Allen-Bradley / Rockwell Automation
 Generates IO lists, EPLAN exports, L5X hardware configs, tag objects, and mirroring code.
 """
+
+APP_VERSION = "1.0.0"
+APP_DATE    = "2026-04-23"
+APP_AUTHOR  = "Anas Abu Ghannam"
+APP_COMPANY = "SAM Engineering Co."
+APP_DESC    = (
+    "Engineering Automation Suite automates the generation of\n"
+    "PLC engineering deliverables for Allen-Bradley / Rockwell\n"
+    "Automation systems, including IO lists, EPLAN exports,\n"
+    "L5X hardware configurations, Studio 5000 tag objects,\n"
+    "and PLC mirroring code.\n\n"
+    "Designed to minimize engineering time and project costs\n"
+    "while maximizing quality and delivery speed."
+)
 import csv
 import os
 import re
@@ -1196,6 +1210,9 @@ class App(tk.Tk):
                  bg=BN, fg=FN, anchor="w").pack(side="left", padx=10, pady=10)
         tk.Label(tf, text="Allen-Bradley / Rockwell Automation",
                  font=("Arial",9), bg=BN, fg="#444").pack(side="left", padx=2)
+        tk.Button(tf, text="ℹ  About", font=("Arial",9), bg=BN, fg="#222",
+                  relief="flat", padx=10, pady=4, cursor="hand2",
+                  command=self._show_about).pack(side="right", padx=10, pady=10)
 
         # Common: input file
         cf = tk.Frame(self, bg=BG, padx=16, pady=8)
@@ -1248,6 +1265,56 @@ class App(tk.Tk):
     def _sec(self, parent, text, font):
         tk.Frame(parent, bg="#c8c8c8", height=1).pack(fill="x", pady=(4,2))
         tk.Label(parent, text=text, font=font, bg="#f5f5f5", fg="#222", anchor="w").pack(fill="x")
+
+    def _show_about(self):
+        win = tk.Toplevel(self)
+        win.title("About")
+        win.resizable(False, False)
+        win.configure(bg="#f5f5f5")
+        win.grab_set()
+
+        # Header bar
+        hf = tk.Frame(win, bg="#c0c0c0", height=60)
+        hf.pack(fill="x")
+        hf.pack_propagate(False)
+        tk.Label(hf, text="Engineering Automation Suite", font=("Arial",14,"bold"),
+                 bg="#c0c0c0", fg="#000").pack(side="left", padx=16, pady=12)
+
+        # Details
+        df = tk.Frame(win, bg="#f5f5f5", padx=24, pady=16)
+        df.pack(fill="both")
+
+        fields = [
+            ("Version",  APP_VERSION),
+            ("Released", APP_DATE),
+            ("Author",   APP_AUTHOR),
+            ("Company",  APP_COMPANY),
+            ("Platform", "Allen-Bradley / Rockwell Automation"),
+        ]
+        for label, value in fields:
+            row = tk.Frame(df, bg="#f5f5f5")
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{label}:", font=("Arial",9,"bold"), bg="#f5f5f5",
+                     fg="#555", width=10, anchor="w").pack(side="left")
+            tk.Label(row, text=value, font=("Arial",9), bg="#f5f5f5",
+                     fg="#111", anchor="w").pack(side="left")
+
+        tk.Frame(df, bg="#c8c8c8", height=1).pack(fill="x", pady=(12,8))
+        tk.Label(df, text=APP_DESC, font=("Arial",9), bg="#f5f5f5", fg="#444",
+                 justify="left", anchor="w").pack(fill="x")
+
+        tk.Frame(df, bg="#c8c8c8", height=1).pack(fill="x", pady=(12,0))
+
+        tk.Button(win, text="Close", font=("Arial",10), bg="#c0c0c0", fg="#000",
+                  relief="flat", padx=20, pady=6, cursor="hand2",
+                  command=win.destroy).pack(pady=12)
+
+        # Center over parent
+        win.update_idletasks()
+        pw = self.winfo_x() + self.winfo_width()  // 2
+        ph = self.winfo_y() + self.winfo_height() // 2
+        ww, wh = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{pw - ww//2}+{ph - wh//2}")
 
     # ── Design Team tab ─────────────────────────────────────
     def _build_design_tab(self, parent, FH, FB, FSM, BG, BN, FN):
